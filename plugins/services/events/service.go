@@ -32,8 +32,11 @@ import (
 	"github.com/containerd/plugin"
 	"github.com/containerd/plugin/registry"
 	"github.com/containerd/ttrpc"
+	"github.com/containerd/typeurl/v2"
 	"google.golang.org/grpc"
 )
+
+var empty = &ptypes.Empty{}
 
 func init() {
 	registry.Register(&plugin.Registration{
@@ -83,7 +86,7 @@ func (s *service) Publish(ctx context.Context, r *api.PublishRequest) (*ptypes.E
 		return nil, errdefs.ToGRPC(err)
 	}
 
-	return &ptypes.Empty{}, nil
+	return empty, nil
 }
 
 func (s *service) Forward(ctx context.Context, r *api.ForwardRequest) (*ptypes.Empty, error) {
@@ -91,7 +94,7 @@ func (s *service) Forward(ctx context.Context, r *api.ForwardRequest) (*ptypes.E
 		return nil, errdefs.ToGRPC(err)
 	}
 
-	return &ptypes.Empty{}, nil
+	return empty, nil
 }
 
 func (s *service) Subscribe(req *api.SubscribeRequest, srv api.Events_SubscribeServer) error {
@@ -120,7 +123,7 @@ func toProto(env *events.Envelope) *types.Envelope {
 		Timestamp: protobuf.ToTimestamp(env.Timestamp),
 		Namespace: env.Namespace,
 		Topic:     env.Topic,
-		Event:     protobuf.FromAny(env.Event),
+		Event:     typeurl.MarshalProto(env.Event),
 	}
 }
 

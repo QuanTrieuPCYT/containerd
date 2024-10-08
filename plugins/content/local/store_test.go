@@ -32,11 +32,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/containerd/errdefs"
+
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/content/testsuite"
+	"github.com/containerd/containerd/v2/internal/fsverity"
 	"github.com/containerd/containerd/v2/internal/randutil"
 	"github.com/containerd/containerd/v2/pkg/testutil"
-	"github.com/containerd/errdefs"
 
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -191,6 +193,18 @@ func TestContentWriter(t *testing.T) {
 
 	if !bytes.Equal(p, pp) {
 		t.Fatal("mismatched data written to disk")
+	}
+
+	// ensure fsverity is enabled on blob if fsverity is supported
+	ok, err := fsverity.IsSupported(tmpdir)
+	if !ok || err != nil {
+		t.Log("fsverity not supported, skipping fsverity check")
+		return
+	}
+
+	ok, err = fsverity.IsEnabled(path)
+	if !ok || err != nil {
+		t.Fatal(err)
 	}
 
 }

@@ -98,7 +98,13 @@ func (s *controllerService) Create(ctx context.Context, req *api.ControllerCreat
 	if err != nil {
 		return nil, errdefs.ToGRPC(err)
 	}
-	err = ctrl.Create(ctx, sandbox.Sandbox{ID: req.GetSandboxID()}, sandbox.WithOptions(req.GetOptions()))
+	var sb sandbox.Sandbox
+	if req.Sandbox != nil {
+		sb = sandbox.FromProto(req.Sandbox)
+	} else {
+		sb = sandbox.Sandbox{ID: req.GetSandboxID()}
+	}
+	err = ctrl.Create(ctx, sb, sandbox.WithOptions(req.GetOptions()))
 	if err != nil {
 		return &api.ControllerCreateResponse{}, errdefs.ToGRPC(err)
 	}
@@ -223,4 +229,22 @@ func (s *controllerService) Metrics(ctx context.Context, req *api.ControllerMetr
 	return &api.ControllerMetricsResponse{
 		Metrics: metrics,
 	}, nil
+}
+
+func (s *controllerService) Update(
+	ctx context.Context,
+	req *api.ControllerUpdateRequest) (*api.ControllerUpdateResponse, error) {
+	log.G(ctx).WithField("req", req).Debug("sandbox update resource")
+	ctrl, err := s.getController(req.Sandboxer)
+	if err != nil {
+		return nil, errdefs.ToGRPC(err)
+	}
+	if req.Sandbox == nil {
+		return nil, fmt.Errorf("sandbox can not be nil")
+	}
+	err = ctrl.Update(ctx, req.SandboxID, sandbox.FromProto(req.Sandbox), req.Fields...)
+	if err != nil {
+		return &api.ControllerUpdateResponse{}, errdefs.ToGRPC(err)
+	}
+	return &api.ControllerUpdateResponse{}, nil
 }

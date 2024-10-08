@@ -25,8 +25,8 @@ import (
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/sandbox"
 	"github.com/containerd/errdefs"
+	"github.com/containerd/typeurl/v2"
 	imagespec "github.com/opencontainers/image-spec/specs-go/v1"
-	"google.golang.org/protobuf/types/known/anypb"
 )
 
 // remoteSandboxController is a low level GRPC client for containerd's sandbox controller service
@@ -46,15 +46,14 @@ func (s *remoteSandboxController) Create(ctx context.Context, sandboxInfo sandbo
 	for _, opt := range opts {
 		opt(&options)
 	}
+	apiSandbox := sandbox.ToProto(&sandboxInfo)
 	_, err := s.client.Create(ctx, &api.ControllerCreateRequest{
-		SandboxID: sandboxInfo.ID,
-		Rootfs:    mount.ToProto(options.Rootfs),
-		Options: &anypb.Any{
-			TypeUrl: options.Options.GetTypeUrl(),
-			Value:   options.Options.GetValue(),
-		},
+		SandboxID:   sandboxInfo.ID,
+		Rootfs:      mount.ToProto(options.Rootfs),
+		Options:     typeurl.MarshalProto(options.Options),
 		NetnsPath:   options.NetNSPath,
 		Annotations: options.Annotations,
+		Sandbox:     apiSandbox,
 	})
 	if err != nil {
 		return errdefs.FromGRPC(err)
@@ -177,4 +176,21 @@ func (s *remoteSandboxController) Metrics(ctx context.Context, sandboxID string)
 		return nil, errdefs.FromGRPC(err)
 	}
 	return resp.Metrics, nil
+}
+
+func (s *remoteSandboxController) Update(
+	ctx context.Context,
+	sandboxID string,
+	sb sandbox.Sandbox,
+	fields ...string) error {
+	apiSandbox := sandbox.ToProto(&sb)
+	_, err := s.client.Update(ctx, &api.ControllerUpdateRequest{
+		SandboxID: sandboxID,
+		Sandbox:   apiSandbox,
+		Fields:    fields,
+	})
+	if err != nil {
+		return errdefs.FromGRPC(err)
+	}
+	return nil
 }

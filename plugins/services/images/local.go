@@ -30,6 +30,7 @@ import (
 	"github.com/containerd/containerd/v2/pkg/deprecation"
 	"github.com/containerd/containerd/v2/pkg/epoch"
 	"github.com/containerd/containerd/v2/pkg/gc"
+	"github.com/containerd/containerd/v2/pkg/oci"
 	ptypes "github.com/containerd/containerd/v2/pkg/protobuf/types"
 	"github.com/containerd/containerd/v2/plugins"
 	"github.com/containerd/containerd/v2/plugins/services"
@@ -38,6 +39,8 @@ import (
 	"github.com/containerd/plugin"
 	"github.com/containerd/plugin/registry"
 )
+
+var empty = &ptypes.Empty{}
 
 func init() {
 	registry.Register(&plugin.Registration{
@@ -168,7 +171,7 @@ func (l *local) Delete(ctx context.Context, req *imagesapi.DeleteImageRequest, _
 
 	var opts []images.DeleteOpt
 	if req.Target != nil {
-		desc := descFromProto(req.Target)
+		desc := oci.DescriptorFromProto(req.Target)
 		opts = append(opts, images.DeleteTarget(&desc))
 	}
 
@@ -183,7 +186,7 @@ func (l *local) Delete(ctx context.Context, req *imagesapi.DeleteImageRequest, _
 		}
 	}
 
-	return &ptypes.Empty{}, nil
+	return empty, nil
 }
 
 func (l *local) emitSchema1DeprecationWarning(ctx context.Context, image *images.Image) {

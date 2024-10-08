@@ -25,8 +25,15 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
 	"strings"
+	"sync"
+
+	"github.com/containerd/errdefs"
+	"github.com/containerd/log"
+	"github.com/opencontainers/go-digest"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/remotes"
@@ -35,10 +42,6 @@ import (
 	"github.com/containerd/containerd/v2/pkg/reference"
 	"github.com/containerd/containerd/v2/pkg/tracing"
 	"github.com/containerd/containerd/v2/version"
-	"github.com/containerd/errdefs"
-	"github.com/containerd/log"
-	"github.com/opencontainers/go-digest"
-	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 var (
@@ -726,13 +729,18 @@ func NewHTTPFallback(transport http.RoundTripper) http.RoundTripper {
 type httpFallback struct {
 	super http.RoundTripper
 	host  string
+	mu    sync.Mutex
 }
 
 func (f *httpFallback) RoundTrip(r *http.Request) (*http.Response, error) {
+	f.mu.Lock()
+	fallback := f.host == r.URL.Host
+	f.mu.Unlock()
+
 	// only fall back if the same host had previously fell back
-	if f.host != r.URL.Host {
+	if !fallback {
 		resp, err := f.super.RoundTrip(r)
-		if !isTLSError(err) {
+		if !isTLSError(err) && !isPortError(err, r.URL.Host) {
 			return resp, err
 		}
 	}
@@ -743,8 +751,12 @@ func (f *httpFallback) RoundTrip(r *http.Request) (*http.Response, error) {
 	plainHTTPRequest := *r
 	plainHTTPRequest.URL = &plainHTTPUrl
 
-	if f.host != r.URL.Host {
-		f.host = r.URL.Host
+	if !fallback {
+		f.mu.Lock()
+		if f.host != r.URL.Host {
+			f.host = r.URL.Host
+		}
+		f.mu.Unlock()
 
 		// update body on the second attempt
 		if r.Body != nil && r.GetBody != nil {
@@ -768,6 +780,18 @@ func isTLSError(err error) bool {
 		return true
 	}
 	if strings.Contains(err.Error(), "TLS handshake timeout") {
+		return true
+	}
+
+	return false
+}
+
+func isPortError(err error, host string) bool {
+	if isConnError(err) || os.IsTimeout(err) {
+		if _, port, _ := net.SplitHostPort(host); port != "" {
+			// Port is specified, will not retry on different port with scheme change
+			return false
+		}
 		return true
 	}
 
