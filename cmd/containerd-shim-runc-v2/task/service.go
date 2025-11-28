@@ -24,8 +24,6 @@ import (
 	"os"
 	"sync"
 
-	"github.com/moby/sys/userns"
-
 	"github.com/containerd/cgroups/v3"
 	"github.com/containerd/cgroups/v3/cgroup1"
 	cgroupsv2 "github.com/containerd/cgroups/v3/cgroup2"
@@ -33,24 +31,27 @@ import (
 	taskAPI "github.com/containerd/containerd/api/runtime/task/v3"
 	"github.com/containerd/containerd/api/types/runc/options"
 	"github.com/containerd/containerd/api/types/task"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/errdefs/pkg/errgrpc"
+	runcC "github.com/containerd/go-runc"
+	"github.com/containerd/log"
+	"github.com/containerd/ttrpc"
+	"github.com/containerd/typeurl/v2"
+	"github.com/moby/sys/userns"
+
 	"github.com/containerd/containerd/v2/cmd/containerd-shim-runc-v2/process"
 	"github.com/containerd/containerd/v2/cmd/containerd-shim-runc-v2/runc"
+	"github.com/containerd/containerd/v2/core/events"
 	"github.com/containerd/containerd/v2/core/runtime"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/containerd/v2/pkg/oom"
 	oomv1 "github.com/containerd/containerd/v2/pkg/oom/v1"
-	oomv2 "github.com/containerd/containerd/v2/pkg/oom/v2"
 	"github.com/containerd/containerd/v2/pkg/protobuf"
 	ptypes "github.com/containerd/containerd/v2/pkg/protobuf/types"
 	"github.com/containerd/containerd/v2/pkg/shim"
 	"github.com/containerd/containerd/v2/pkg/shutdown"
 	"github.com/containerd/containerd/v2/pkg/stdio"
 	"github.com/containerd/containerd/v2/pkg/sys/reaper"
-	"github.com/containerd/errdefs"
-	runcC "github.com/containerd/go-runc"
-	"github.com/containerd/log"
-	"github.com/containerd/ttrpc"
-	"github.com/containerd/typeurl/v2"
 )
 
 var (
@@ -64,20 +65,19 @@ func NewTaskService(ctx context.Context, publisher shim.Publisher, sd shutdown.S
 		ep  oom.Watcher
 		err error
 	)
-	if cgroups.Mode() == cgroups.Unified {
-		ep, err = oomv2.New(publisher)
-	} else {
+	if cgroups.Mode() != cgroups.Unified {
 		ep, err = oomv1.New(publisher)
+		if err != nil {
+			return nil, err
+		}
+		go ep.Run(ctx)
 	}
-	if err != nil {
-		return nil, err
-	}
-	go ep.Run(ctx)
 	s := &service{
 		context:              ctx,
 		events:               make(chan interface{}, 128),
 		ec:                   reaper.Default.Subscribe(),
-		ep:                   ep,
+		cg1oom:               ep,
+		publisher:            publisher,
 		shutdown:             sd,
 		containers:           make(map[string]*runc.Container),
 		running:              make(map[int][]containerProcess),
@@ -113,7 +113,9 @@ type service struct {
 	events   chan interface{}
 	platform stdio.Platform
 	ec       chan runcC.Exit
-	ep       oom.Watcher
+	cg1oom   oom.Watcher
+
+	publisher events.Publisher
 
 	containers map[string]*runc.Container
 
@@ -249,6 +251,33 @@ func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (_ *
 		Pid:        uint32(container.Pid()),
 	})
 
+	// After runc.Create(init), the container’s cgroup contains a paused init process.
+	// Therefore, we should start monitoring OOM events immediately after creation, in
+	// case the process goes OOM very quickly. Otherwise, we may encounter flaky cases
+	switch cg := container.Cgroup().(type) {
+	case cgroup1.Cgroup:
+		if err := s.cg1oom.Add(container.ID, cg); err != nil {
+			log.G(ctx).WithError(err).Error("add cg to OOM monitor")
+		}
+	case *cgroupsv2.Manager:
+		allControllers, err := cg.RootControllers()
+		if err != nil {
+			log.G(ctx).WithError(err).Error("failed to get root controllers")
+		} else {
+			if err := cg.ToggleControllers(allControllers, cgroupsv2.Enable); err != nil {
+				if userns.RunningInUserNS() {
+					log.G(ctx).WithError(err).Debugf("failed to enable controllers (%v)", allControllers)
+				} else {
+					log.G(ctx).WithError(err).Errorf("failed to enable controllers (%v)", allControllers)
+				}
+			}
+		}
+
+		if err := container.OOMWatch(ctx, s.oomEvent); err != nil {
+			log.G(ctx).WithError(err).WithField("container_id", container.ID).Error("failed to watch oom events")
+		}
+	}
+
 	// The following line cannot return an error as the only state in which that
 	// could happen would also cause the container.Pid() call above to
 	// nil-deference panic.
@@ -279,7 +308,7 @@ func (s *service) Start(ctx context.Context, r *taskAPI.StartRequest) (*taskAPI.
 	} else {
 		if _, initExited := s.containerInitExit[container]; initExited {
 			s.lifecycleMu.Unlock()
-			return nil, errdefs.ToGRPCf(errdefs.ErrFailedPrecondition, "container %s init process is not running", container.ID)
+			return nil, errgrpc.ToGRPCf(errdefs.ErrFailedPrecondition, "container %s init process is not running", container.ID)
 		}
 		s.runningExecs[container]++
 	}
@@ -301,34 +330,11 @@ func (s *service) Start(ctx context.Context, r *taskAPI.StartRequest) (*taskAPI.
 			s.lifecycleMu.Unlock()
 		}
 		handleStarted(container, p)
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 
 	switch r.ExecID {
 	case "":
-		switch cg := container.Cgroup().(type) {
-		case cgroup1.Cgroup:
-			if err := s.ep.Add(container.ID, cg); err != nil {
-				log.G(ctx).WithError(err).Error("add cg to OOM monitor")
-			}
-		case *cgroupsv2.Manager:
-			allControllers, err := cg.RootControllers()
-			if err != nil {
-				log.G(ctx).WithError(err).Error("failed to get root controllers")
-			} else {
-				if err := cg.ToggleControllers(allControllers, cgroupsv2.Enable); err != nil {
-					if userns.RunningInUserNS() {
-						log.G(ctx).WithError(err).Debugf("failed to enable controllers (%v)", allControllers)
-					} else {
-						log.G(ctx).WithError(err).Errorf("failed to enable controllers (%v)", allControllers)
-					}
-				}
-			}
-			if err := s.ep.Add(container.ID, cg); err != nil {
-				log.G(ctx).WithError(err).Error("add cg to OOM monitor")
-			}
-		}
-
 		s.send(&eventstypes.TaskStart{
 			ContainerID: container.ID,
 			Pid:         uint32(p.Pid()),
@@ -354,7 +360,7 @@ func (s *service) Delete(ctx context.Context, r *taskAPI.DeleteRequest) (*taskAP
 	}
 	p, err := container.Delete(ctx, r)
 	if err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	// if we deleted an init task, send the task delete event
 	if r.ExecID == "" {
@@ -367,6 +373,9 @@ func (s *service) Delete(ctx context.Context, r *taskAPI.DeleteRequest) (*taskAP
 			ExitStatus:  uint32(p.ExitStatus()),
 			ExitedAt:    protobuf.ToTimestamp(p.ExitedAt()),
 		})
+		s.lifecycleMu.Lock()
+		delete(s.containerInitExit, container)
+		s.lifecycleMu.Unlock()
 	}
 	return &taskAPI.DeleteResponse{
 		ExitStatus: uint32(p.ExitStatus()),
@@ -383,12 +392,12 @@ func (s *service) Exec(ctx context.Context, r *taskAPI.ExecProcessRequest) (*pty
 	}
 	ok, cancel := container.ReserveProcess(r.ExecID)
 	if !ok {
-		return nil, errdefs.ToGRPCf(errdefs.ErrAlreadyExists, "id %s", r.ExecID)
+		return nil, errgrpc.ToGRPCf(errdefs.ErrAlreadyExists, "id %s", r.ExecID)
 	}
 	process, err := container.Exec(ctx, r)
 	if err != nil {
 		cancel()
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 
 	s.send(&eventstypes.TaskExecAdded{
@@ -405,7 +414,7 @@ func (s *service) ResizePty(ctx context.Context, r *taskAPI.ResizePtyRequest) (*
 		return nil, err
 	}
 	if err := container.ResizePty(ctx, r); err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	return empty, nil
 }
@@ -418,7 +427,7 @@ func (s *service) State(ctx context.Context, r *taskAPI.StateRequest) (*taskAPI.
 	}
 	p, err := container.Process(r.ExecID)
 	if err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	st, err := p.Status(ctx)
 	if err != nil {
@@ -459,7 +468,7 @@ func (s *service) Pause(ctx context.Context, r *taskAPI.PauseRequest) (*ptypes.E
 		return nil, err
 	}
 	if err := container.Pause(ctx); err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	s.send(&eventstypes.TaskPaused{
 		ContainerID: container.ID,
@@ -474,7 +483,7 @@ func (s *service) Resume(ctx context.Context, r *taskAPI.ResumeRequest) (*ptypes
 		return nil, err
 	}
 	if err := container.Resume(ctx); err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	s.send(&eventstypes.TaskResumed{
 		ContainerID: container.ID,
@@ -489,7 +498,7 @@ func (s *service) Kill(ctx context.Context, r *taskAPI.KillRequest) (*ptypes.Emp
 		return nil, err
 	}
 	if err := container.Kill(ctx, r); err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	return empty, nil
 }
@@ -502,7 +511,7 @@ func (s *service) Pids(ctx context.Context, r *taskAPI.PidsRequest) (*taskAPI.Pi
 	}
 	pids, err := s.getContainerPids(ctx, container)
 	if err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	var processes []*task.ProcessInfo
 	for _, pid := range pids {
@@ -548,7 +557,7 @@ func (s *service) Checkpoint(ctx context.Context, r *taskAPI.CheckpointTaskReque
 		return nil, err
 	}
 	if err := container.Checkpoint(ctx, r); err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	return empty, nil
 }
@@ -560,7 +569,7 @@ func (s *service) Update(ctx context.Context, r *taskAPI.UpdateTaskRequest) (*pt
 		return nil, err
 	}
 	if err := container.Update(ctx, r); err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	return empty, nil
 }
@@ -573,9 +582,12 @@ func (s *service) Wait(ctx context.Context, r *taskAPI.WaitRequest) (*taskAPI.Wa
 	}
 	p, err := container.Process(r.ExecID)
 	if err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
-	p.Wait()
+
+	if err = p.Wait(ctx); err != nil {
+		return nil, errgrpc.ToGRPC(err)
+	}
 
 	return &taskAPI.WaitResponse{
 		ExitStatus: uint32(p.ExitStatus()),
@@ -618,7 +630,7 @@ func (s *service) Stats(ctx context.Context, r *taskAPI.StatsRequest) (*taskAPI.
 	}
 	cgx := container.Cgroup()
 	if cgx == nil {
-		return nil, errdefs.ToGRPCf(errdefs.ErrNotFound, "cgroup does not exist")
+		return nil, errgrpc.ToGRPCf(errdefs.ErrNotFound, "cgroup does not exist")
 	}
 	var statsx interface{}
 	switch cg := cgx.(type) {
@@ -635,7 +647,7 @@ func (s *service) Stats(ctx context.Context, r *taskAPI.StatsRequest) (*taskAPI.
 		}
 		statsx = stats
 	default:
-		return nil, errdefs.ToGRPCf(errdefs.ErrNotImplemented, "unsupported cgroup type %T", cg)
+		return nil, errgrpc.ToGRPCf(errdefs.ErrNotImplemented, "unsupported cgroup type %T", cg)
 	}
 	data, err := typeurl.MarshalAny(statsx)
 	if err != nil {
@@ -682,6 +694,15 @@ func (s *service) processExits() {
 				s.handleProcessExit(e, cp.Container, cp.Process)
 			}
 		}
+	}
+}
+
+func (s *service) oomEvent(id string) {
+	err := s.publisher.Publish(s.context, runtime.TaskOOMEventTopic, &eventstypes.TaskOOM{
+		ContainerID: id,
+	})
+	if err != nil {
+		log.G(s.context).WithError(err).Error("post event")
 	}
 }
 
@@ -764,7 +785,7 @@ func (s *service) handleProcessExit(e runcC.Exit, c *runc.Container, p process.P
 func (s *service) getContainerPids(ctx context.Context, container *runc.Container) ([]uint32, error) {
 	p, err := container.Process("")
 	if err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	ps, err := p.(*process.Init).Runtime().Ps(ctx, container.ID)
 	if err != nil {
@@ -794,7 +815,7 @@ func (s *service) getContainer(id string) (*runc.Container, error) {
 	container := s.containers[id]
 	s.mu.Unlock()
 	if container == nil {
-		return nil, errdefs.ToGRPCf(errdefs.ErrNotFound, "container not created")
+		return nil, errgrpc.ToGRPCf(errdefs.ErrNotFound, "container not created")
 	}
 	return container, nil
 }

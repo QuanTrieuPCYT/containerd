@@ -29,6 +29,14 @@ import (
 	"github.com/containerd/containerd/api/services/tasks/v1"
 	"github.com/containerd/containerd/api/types"
 	"github.com/containerd/containerd/api/types/runc/options"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/errdefs/pkg/errgrpc"
+	"github.com/containerd/typeurl/v2"
+	digest "github.com/opencontainers/go-digest"
+	is "github.com/opencontainers/image-spec/specs-go"
+	v1 "github.com/opencontainers/image-spec/specs-go/v1"
+	specs "github.com/opencontainers/runtime-spec/specs-go"
+
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/diff"
 	"github.com/containerd/containerd/v2/core/images"
@@ -40,12 +48,6 @@ import (
 	"github.com/containerd/containerd/v2/pkg/rootfs"
 	"github.com/containerd/containerd/v2/pkg/tracing"
 	"github.com/containerd/containerd/v2/plugins"
-	"github.com/containerd/errdefs"
-	"github.com/containerd/typeurl/v2"
-	digest "github.com/opencontainers/go-digest"
-	is "github.com/opencontainers/image-spec/specs-go"
-	v1 "github.com/opencontainers/image-spec/specs-go/v1"
-	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
 // UnknownExitStatus is returned when containerd is unable to
@@ -144,11 +146,39 @@ type TaskInfo struct {
 
 	// runtime is the runtime name for the container, and cannot be changed.
 	runtime string
+
+	// runtimeOptions is the runtime options for the container, and when task options are set,
+	// they will be based on the runtimeOptions.
+	// https://github.com/containerd/containerd/issues/11568
+	runtimeOptions typeurl.Any
 }
 
 // Runtime name for the container
 func (i *TaskInfo) Runtime() string {
 	return i.runtime
+}
+
+// getRuncOptions returns a reference to the runtime options for use by the task.
+// If the set of options is not set by the opts passed into the NewTask creation
+// this function first attempts to initialize the runtime options with a copy of the runtimeOptions,
+// otherwise an empty set of options is assigned and returned
+func (i *TaskInfo) getRuncOptions() (*options.Options, error) {
+	if i.Options != nil {
+		opts, ok := i.Options.(*options.Options)
+		if !ok {
+			return nil, errors.New("invalid runtime v2 options format")
+		}
+		return opts, nil
+	}
+
+	opts := &options.Options{}
+	if i.runtimeOptions != nil && i.runtimeOptions.GetValue() != nil {
+		if err := typeurl.UnmarshalTo(i.runtimeOptions, opts); err != nil {
+			return nil, fmt.Errorf("failed to get runtime v2 options: %w", err)
+		}
+	}
+	i.Options = opts
+	return opts, nil
 }
 
 // Task is the executable object within containerd
@@ -223,7 +253,7 @@ func (t *task) Start(ctx context.Context) error {
 			t.io.Cancel()
 			t.io.Close()
 		}
-		return errdefs.FromGRPC(err)
+		return errgrpc.ToNative(err)
 	}
 	span.SetAttributes(tracing.Attribute("task.pid", r.Pid))
 	t.pid = r.Pid
@@ -254,7 +284,7 @@ func (t *task) Kill(ctx context.Context, s syscall.Signal, opts ...KillOpts) err
 		All:         i.All,
 	})
 	if err != nil {
-		return errdefs.FromGRPC(err)
+		return errgrpc.ToNative(err)
 	}
 	return nil
 }
@@ -267,7 +297,7 @@ func (t *task) Pause(ctx context.Context) error {
 	_, err := t.client.TaskService().Pause(ctx, &tasks.PauseTaskRequest{
 		ContainerID: t.id,
 	})
-	return errdefs.FromGRPC(err)
+	return errgrpc.ToNative(err)
 }
 
 func (t *task) Resume(ctx context.Context) error {
@@ -278,7 +308,7 @@ func (t *task) Resume(ctx context.Context) error {
 	_, err := t.client.TaskService().Resume(ctx, &tasks.ResumeTaskRequest{
 		ContainerID: t.id,
 	})
-	return errdefs.FromGRPC(err)
+	return errgrpc.ToNative(err)
 }
 
 func (t *task) Status(ctx context.Context) (Status, error) {
@@ -286,7 +316,7 @@ func (t *task) Status(ctx context.Context) (Status, error) {
 		ContainerID: t.id,
 	})
 	if err != nil {
-		return Status{}, errdefs.FromGRPC(err)
+		return Status{}, errgrpc.ToNative(err)
 	}
 	status := ProcessStatus(strings.ToLower(r.Process.Status.String()))
 	exitStatus := r.Process.ExitStatus
@@ -343,10 +373,15 @@ func (t *task) Delete(ctx context.Context, opts ...ProcessDeleteOpts) (*ExitStat
 		return nil, err
 	}
 
+	runtime, err := t.client.defaultRuntime(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get default runtime: %w", err)
+	}
+
 	switch status.Status {
 	case Stopped, Unknown, "":
 	case Created:
-		if t.client.runtime == plugins.RuntimePlugin.String()+".windows" {
+		if runtime == plugins.RuntimePlugin.String()+".windows" {
 			// On windows Created is akin to Stopped
 			break
 		}
@@ -363,7 +398,7 @@ func (t *task) Delete(ctx context.Context, opts ...ProcessDeleteOpts) (*ExitStat
 		// io.Wait locks for restored tasks on Windows unless we call
 		// io.Close first (https://github.com/containerd/containerd/issues/5621)
 		// in other cases, preserve the contract and let IO finish before closing
-		if t.client.runtime == plugins.RuntimePlugin.String()+".windows" {
+		if runtime == plugins.RuntimePlugin.String()+".windows" {
 			t.io.Close()
 		}
 		// io.Cancel is used to cancel the io goroutine while it is in
@@ -377,7 +412,7 @@ func (t *task) Delete(ctx context.Context, opts ...ProcessDeleteOpts) (*ExitStat
 		ContainerID: t.id,
 	})
 	if err != nil {
-		return nil, errdefs.FromGRPC(err)
+		return nil, errgrpc.ToNative(err)
 	}
 	// Only cleanup the IO after a successful Delete
 	if t.io != nil {
@@ -386,7 +421,7 @@ func (t *task) Delete(ctx context.Context, opts ...ProcessDeleteOpts) (*ExitStat
 	return &ExitStatus{code: r.ExitStatus, exitedAt: protobuf.FromTimestamp(r.ExitedAt)}, nil
 }
 
-func (t *task) Exec(ctx context.Context, id string, spec *specs.Process, ioCreate cio.Creator) (_ Process, err error) {
+func (t *task) Exec(ctx context.Context, id string, spec *specs.Process, ioCreate cio.Creator) (_ Process, retErr error) {
 	ctx, span := tracing.StartSpan(ctx, "task.Exec",
 		tracing.WithAttribute("task.id", t.ID()),
 	)
@@ -400,7 +435,7 @@ func (t *task) Exec(ctx context.Context, id string, spec *specs.Process, ioCreat
 		return nil, err
 	}
 	defer func() {
-		if err != nil && i != nil {
+		if retErr != nil && i != nil {
 			i.Cancel()
 			i.Close()
 		}
@@ -423,7 +458,7 @@ func (t *task) Exec(ctx context.Context, id string, spec *specs.Process, ioCreat
 		i.Cancel()
 		i.Wait()
 		i.Close()
-		return nil, errdefs.FromGRPC(err)
+		return nil, errgrpc.ToNative(err)
 	}
 	return &process{
 		id:   id,
@@ -437,7 +472,7 @@ func (t *task) Pids(ctx context.Context) ([]ProcessInfo, error) {
 		ContainerID: t.id,
 	})
 	if err != nil {
-		return nil, errdefs.FromGRPC(err)
+		return nil, errgrpc.ToNative(err)
 	}
 	var processList []ProcessInfo
 	for _, p := range response.Processes {
@@ -464,7 +499,7 @@ func (t *task) CloseIO(ctx context.Context, opts ...IOCloserOpts) error {
 	r.Stdin = i.Stdin
 
 	_, err := t.client.TaskService().CloseIO(ctx, r)
-	return errdefs.FromGRPC(err)
+	return errgrpc.ToNative(err)
 }
 
 func (t *task) IO() cio.IO {
@@ -481,7 +516,7 @@ func (t *task) Resize(ctx context.Context, w, h uint32) error {
 		Width:       w,
 		Height:      h,
 	})
-	return errdefs.FromGRPC(err)
+	return errgrpc.ToNative(err)
 }
 
 // NOTE: Checkpoint supports to dump task information to a directory, in this way, an empty
@@ -613,7 +648,7 @@ func (t *task) Update(ctx context.Context, opts ...UpdateTaskOpts) error {
 		request.Annotations = i.Annotations
 	}
 	_, err := t.client.TaskService().Update(ctx, request)
-	return errdefs.FromGRPC(err)
+	return errgrpc.ToNative(err)
 }
 
 func (t *task) LoadProcess(ctx context.Context, id string, ioAttach cio.Attach) (Process, error) {
@@ -625,7 +660,7 @@ func (t *task) LoadProcess(ctx context.Context, id string, ioAttach cio.Attach) 
 		ExecID:      id,
 	})
 	if err != nil {
-		err = errdefs.FromGRPC(err)
+		err = errgrpc.ToNative(err)
 		if errdefs.IsNotFound(err) {
 			return nil, fmt.Errorf("no running process found: %w", err)
 		}
@@ -651,7 +686,7 @@ func (t *task) Metrics(ctx context.Context) (*types.Metric, error) {
 		},
 	})
 	if err != nil {
-		return nil, errdefs.FromGRPC(err)
+		return nil, errgrpc.ToNative(err)
 	}
 
 	if response.Metrics == nil {
@@ -668,7 +703,7 @@ func (t *task) Metrics(ctx context.Context) (*types.Metric, error) {
 func (t *task) checkpointTask(ctx context.Context, index *v1.Index, request *tasks.CheckpointTaskRequest) error {
 	response, err := t.client.TaskService().Checkpoint(ctx, request)
 	if err != nil {
-		return errdefs.FromGRPC(err)
+		return errgrpc.ToNative(err)
 	}
 	// NOTE: response.Descriptors can be an empty slice if checkpoint image is jumped
 	// add the checkpoint descriptors to the index

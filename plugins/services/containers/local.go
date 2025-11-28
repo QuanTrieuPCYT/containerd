@@ -22,13 +22,7 @@ import (
 
 	eventstypes "github.com/containerd/containerd/api/events"
 	api "github.com/containerd/containerd/api/services/containers/v1"
-	"github.com/containerd/containerd/v2/core/containers"
-	"github.com/containerd/containerd/v2/core/events"
-	"github.com/containerd/containerd/v2/core/metadata"
-	ptypes "github.com/containerd/containerd/v2/pkg/protobuf/types"
-	"github.com/containerd/containerd/v2/plugins"
-	"github.com/containerd/containerd/v2/plugins/services"
-	"github.com/containerd/errdefs"
+	"github.com/containerd/errdefs/pkg/errgrpc"
 	"github.com/containerd/plugin"
 	"github.com/containerd/plugin/registry"
 	bolt "go.etcd.io/bbolt"
@@ -36,6 +30,14 @@ import (
 	"google.golang.org/grpc/codes"
 	grpcm "google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+
+	"github.com/containerd/containerd/v2/core/containers"
+	"github.com/containerd/containerd/v2/core/events"
+	"github.com/containerd/containerd/v2/core/metadata"
+	"github.com/containerd/containerd/v2/core/metadata/boltutil"
+	ptypes "github.com/containerd/containerd/v2/pkg/protobuf/types"
+	"github.com/containerd/containerd/v2/plugins"
+	"github.com/containerd/containerd/v2/plugins/services"
 )
 
 var empty = &ptypes.Empty{}
@@ -79,7 +81,7 @@ var _ api.ContainersClient = &local{}
 func (l *local) Get(ctx context.Context, req *api.GetContainerRequest, _ ...grpc.CallOption) (*api.GetContainerResponse, error) {
 	var resp api.GetContainerResponse
 
-	return &resp, errdefs.ToGRPC(l.withStoreView(ctx, func(ctx context.Context) error {
+	return &resp, errgrpc.ToGRPC(l.withStoreView(ctx, func(ctx context.Context) error {
 		container, err := l.Store.Get(ctx, req.ID)
 		if err != nil {
 			return err
@@ -93,7 +95,7 @@ func (l *local) Get(ctx context.Context, req *api.GetContainerRequest, _ ...grpc
 
 func (l *local) List(ctx context.Context, req *api.ListContainersRequest, _ ...grpc.CallOption) (*api.ListContainersResponse, error) {
 	var resp api.ListContainersResponse
-	return &resp, errdefs.ToGRPC(l.withStoreView(ctx, func(ctx context.Context) error {
+	return &resp, errgrpc.ToGRPC(l.withStoreView(ctx, func(ctx context.Context) error {
 		containers, err := l.Store.List(ctx, req.Filters...)
 		if err != nil {
 			return err
@@ -107,7 +109,7 @@ func (l *local) ListStream(ctx context.Context, req *api.ListContainersRequest, 
 	stream := &localStream{
 		ctx: ctx,
 	}
-	return stream, errdefs.ToGRPC(l.withStoreView(ctx, func(ctx context.Context) error {
+	return stream, errgrpc.ToGRPC(l.withStoreView(ctx, func(ctx context.Context) error {
 		containers, err := l.Store.List(ctx, req.Filters...)
 		if err != nil {
 			return err
@@ -132,7 +134,7 @@ func (l *local) Create(ctx context.Context, req *api.CreateContainerRequest, _ .
 
 		return nil
 	}); err != nil {
-		return &resp, errdefs.ToGRPC(err)
+		return &resp, errgrpc.ToGRPC(err)
 	}
 	if err := l.publisher.Publish(ctx, "/containers/create", &eventstypes.ContainerCreate{
 		ID:    resp.Container.ID,
@@ -171,7 +173,7 @@ func (l *local) Update(ctx context.Context, req *api.UpdateContainerRequest, _ .
 		resp.Container = containerToProto(&updated)
 		return nil
 	}); err != nil {
-		return &resp, errdefs.ToGRPC(err)
+		return &resp, errgrpc.ToGRPC(err)
 	}
 
 	if err := l.publisher.Publish(ctx, "/containers/update", &eventstypes.ContainerUpdate{
@@ -190,7 +192,7 @@ func (l *local) Delete(ctx context.Context, req *api.DeleteContainerRequest, _ .
 	if err := l.withStoreUpdate(ctx, func(ctx context.Context) error {
 		return l.Store.Delete(ctx, req.ID)
 	}); err != nil {
-		return empty, errdefs.ToGRPC(err)
+		return empty, errgrpc.ToGRPC(err)
 	}
 
 	if err := l.publisher.Publish(ctx, "/containers/delete", &eventstypes.ContainerDelete{
@@ -204,7 +206,7 @@ func (l *local) Delete(ctx context.Context, req *api.DeleteContainerRequest, _ .
 
 func (l *local) withStore(ctx context.Context, fn func(ctx context.Context) error) func(tx *bolt.Tx) error {
 	return func(tx *bolt.Tx) error {
-		return fn(metadata.WithTransactionContext(ctx, tx))
+		return fn(boltutil.WithTransaction(ctx, tx))
 	}
 }
 

@@ -44,6 +44,7 @@ import (
 	_ "github.com/containerd/containerd/v2/plugins/gc"
 	_ "github.com/containerd/containerd/v2/plugins/leases"
 	_ "github.com/containerd/containerd/v2/plugins/metadata"
+	_ "github.com/containerd/containerd/v2/plugins/mount"
 	_ "github.com/containerd/containerd/v2/plugins/services/containers"
 	_ "github.com/containerd/containerd/v2/plugins/services/content"
 	_ "github.com/containerd/containerd/v2/plugins/services/diff"
@@ -55,6 +56,7 @@ import (
 	_ "github.com/containerd/containerd/v2/plugins/services/snapshots"
 	_ "github.com/containerd/containerd/v2/plugins/services/tasks"
 	_ "github.com/containerd/containerd/v2/plugins/services/version"
+	_ "github.com/containerd/containerd/v2/plugins/transfer"
 
 	"github.com/stretchr/testify/require"
 )

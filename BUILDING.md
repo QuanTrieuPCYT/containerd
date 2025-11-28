@@ -25,7 +25,7 @@ A codespace will open in a web-based version of Visual Studio Code. The [dev con
 
 To build the `containerd` daemon, and the `ctr` simple test client, the following build system dependencies are required:
 
-* Go 1.22.x or above
+* Go compiler (download from https://go.dev/dl/). The two most recent major Go versions are supported. For example, if Go 1.25 is the latest, then 1.25 and 1.24 are supported.
 * Protoc 3.x compiler and headers (download at the [Google protobuf releases page](https://github.com/protocolbuffers/protobuf/releases))
 * Btrfs headers and libraries for your distribution. Note that building the btrfs driver can be disabled via the build tag `no_btrfs`, removing this dependency.
 
@@ -270,25 +270,25 @@ name and also how to use the flag directly against `go test` to run root-requiri
 
 ```sh
 # run the test <TEST_NAME>:
-go test	-v -run "<TEST_NAME>" .
+go test	-v -run "<TEST_NAME>" ./path/to/package
 # enable the root-requiring tests:
-go test -v -run . -test.root
+go test -v -run ./path/to/package -test.root
 ```
 
 Example output from directly running `go test` to execute the `TestContainerList` test:
 
 ```sh
-sudo go test -v -run "TestContainerList" . -test.root
-INFO[0000] running tests against containerd revision=f2ae8a020a985a8d9862c9eb5ab66902c2888361 version=v1.0.0-beta.2-49-gf2ae8a0
+sudo go test -v -run "TestContainerList" ./integration/client -test.root
 === RUN   TestContainerList
 --- PASS: TestContainerList (0.00s)
 PASS
-ok  	github.com/containerd/containerd	4.778s
+
+ok      github.com/containerd/containerd/v2/integration/client  2.584s
 ```
 
 > *Note*: in order to run `sudo go` you need to
 > - either keep user PATH environment variable. ex: `sudo "PATH=$PATH" env go test <args>`
-> - or use `go test -exec` ex: `go test -exec sudo -v -run "TestTarWithXattr" ./archive/ -test.root`
+> - or use `go test -exec` ex: `go test -exec sudo -v -run "TestTarWithXattr" ./pkg/archive -test.root`
 
 ## Additional tools
 

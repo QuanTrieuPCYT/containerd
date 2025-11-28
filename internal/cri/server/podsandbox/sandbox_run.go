@@ -20,6 +20,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
+	"strings"
 
 	"github.com/containerd/log"
 	"github.com/containerd/nri"
@@ -40,6 +42,7 @@ import (
 	sandboxstore "github.com/containerd/containerd/v2/internal/cri/store/sandbox"
 	ctrdutil "github.com/containerd/containerd/v2/internal/cri/util"
 	containerdio "github.com/containerd/containerd/v2/pkg/cio"
+	"github.com/containerd/containerd/v2/pkg/deprecation"
 	"github.com/containerd/errdefs"
 )
 
@@ -136,6 +139,7 @@ func (c *Controller) Start(ctx context.Context, id string) (cin sandbox.Controll
 	if err != nil {
 		return cin, fmt.Errorf("failed to generate sandbox container spec: %w", err)
 	}
+
 	log.G(ctx).WithField("podsandboxid", id).Debugf("sandbox container spec: %#+v", spew.NewFormatter(spec))
 
 	metadata.ProcessLabel = spec.Process.SelinuxLabel
@@ -155,6 +159,18 @@ func (c *Controller) Start(ctx context.Context, id string) (cin sandbox.Controll
 		// If privileged don't set selinux label, but we still record the MCS label so that
 		// the unused label can be freed later.
 		spec.Process.SelinuxLabel = ""
+		// If privileged is enabled, sysfs should have the rw attribute
+		for i, k := range spec.Mounts {
+			if filepath.Clean(k.Destination) == "/sys" {
+				for j, v := range spec.Mounts[i].Options {
+					if v == "ro" {
+						spec.Mounts[i].Options[j] = "rw"
+						break
+					}
+				}
+				break
+			}
+		}
 	}
 
 	// Generate spec options that will be applied to the spec later.
@@ -163,7 +179,7 @@ func (c *Controller) Start(ctx context.Context, id string) (cin sandbox.Controll
 		return cin, fmt.Errorf("failed to generate sandbox container spec options: %w", err)
 	}
 
-	sandboxLabels := buildLabels(config.Labels, image.ImageSpec.Config.Labels, crilabels.ContainerKindSandbox)
+	sandboxLabels := ctrdutil.BuildLabels(config.Labels, image.ImageSpec.Config.Labels, crilabels.ContainerKindSandbox)
 
 	snapshotterOpt := []snapshots.Opt{snapshots.WithLabels(snapshots.FilterInheritedLabels(config.Annotations))}
 	extraSOpts, err := sandboxSnapshotterOpts(config)
@@ -247,16 +263,22 @@ func (c *Controller) Start(ctx context.Context, id string) (cin sandbox.Controll
 		return cin, fmt.Errorf("failed to wait for sandbox container task: %w", err)
 	}
 
-	nric, err := nri.New()
+	nric, err := nri.New() //nolint:staticcheck
 	if err != nil {
 		return cin, fmt.Errorf("unable to create nri client: %w", err)
 	}
 	if nric != nil {
-		nriSB := &nri.Sandbox{
+		if plugins := nric.Plugins(); len(plugins) != 0 { //nolint:staticcheck
+			c.warningService.Emit(ctx, deprecation.NRIV010Plugin)
+			msg, _ := deprecation.Message(deprecation.NRIV010Plugin)
+			log.G(ctx).Warnf("Deprecated NRI plugin(s) %s: %s", strings.Join(plugins, ","), msg)
+		}
+
+		nriSB := &nri.Sandbox{ //nolint:staticcheck
 			ID:     id,
 			Labels: config.Labels,
 		}
-		if _, err := nric.InvokeWithSandbox(ctx, task, v1.Create, nriSB); err != nil {
+		if _, err := nric.InvokeWithSandbox(ctx, task, v1.Create, nriSB); err != nil { //nolint:staticcheck
 			return cin, fmt.Errorf("nri invoke: %w", err)
 		}
 	}

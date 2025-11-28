@@ -19,6 +19,9 @@ containerd is designed to be embedded into a larger system, rather than being us
 
 ## Announcements
 
+### containerd v2.0 is now released!
+See [`docs/containerd-2.0.md`](docs/containerd-2.0.md).
+
 ### Now Recruiting
 
 We are a large inclusive OSS project that is welcoming help of any kind shape or form:
@@ -160,6 +163,8 @@ For async communication and long-running discussions please use issues and pull 
 This will be the best place to discuss design and implementation.
 
 For sync communication catch us in the `#containerd` and `#containerd-dev` Slack channels on Cloud Native Computing Foundation's (CNCF) Slack - `cloud-native.slack.com`. Everyone is welcome to join and chat. [Get Invite to CNCF Slack.](https://slack.cncf.io)
+
+Join our next community meeting hosted on Zoom. The schedule is posted on the [CNCF Calendar](https://www.cncf.io/calendar/) (search 'containerd' to filter).
 
 ### Security audit
 

@@ -27,16 +27,19 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/containerd/log"
+	"github.com/containerd/platforms"
+
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/cmd/ctr/commands"
 	"github.com/containerd/containerd/v2/contrib/apparmor"
 	"github.com/containerd/containerd/v2/contrib/nvidia"
 	"github.com/containerd/containerd/v2/contrib/seccomp"
 	"github.com/containerd/containerd/v2/core/containers"
+	"github.com/containerd/containerd/v2/core/diff"
 	"github.com/containerd/containerd/v2/core/snapshots"
+	cdispec "github.com/containerd/containerd/v2/pkg/cdi"
 	"github.com/containerd/containerd/v2/pkg/oci"
-	"github.com/containerd/log"
-	"github.com/containerd/platforms"
 
 	"github.com/intel/goresctrl/pkg/blockio"
 	"github.com/opencontainers/runtime-spec/specs-go"
@@ -80,6 +83,10 @@ var platformRunFlags = []cli.Flag{
 		Name:  "cpuset-mems",
 		Usage: "Set the memory nodes the container will run in (e.g., 1-2,4)",
 	},
+	&cli.StringFlag{
+		Name:  "rlimit-nofile",
+		Usage: "Set RLIMIT_NOFILE (soft:hard)",
+	},
 }
 
 // NewContainer creates a new container
@@ -92,6 +99,24 @@ func NewContainer(ctx context.Context, client *containerd.Client, cliContext *cl
 		id = cliContext.Args().First()
 	} else {
 		id = cliContext.Args().Get(1)
+	}
+
+	platform := cliContext.String("platform")
+	if platform == "" {
+		plat := platforms.DefaultSpec()
+		switch plat.OS {
+		case "linux":
+		case "freebsd":
+			// TODO: freebsd support is under development, allow platform to remain unchanged.
+			// A freebsd spec generator must be implemented to make use of it, until then,
+			// either a spec must be provided or the runtime can convert from the linux spec.
+		default:
+			// Other OSes do not have a supported container runtime, to use experimental runtimes,
+			// specs must be explicitly provided. Once there is a support spec generator, then
+			// the default platform can be added above to not default to linux.
+			plat.OS = "linux"
+		}
+		platform = platforms.FormatAll(plat)
 	}
 
 	var (
@@ -113,7 +138,7 @@ func NewContainer(ctx context.Context, client *containerd.Client, cliContext *cl
 			// for container's id is Args[1]
 			args = cliContext.Args().Slice()[2:]
 		)
-		opts = append(opts, oci.WithDefaultSpec(), oci.WithDefaultUnixDevices)
+		opts = append(opts, oci.WithDefaultSpecForPlatform(platform), oci.WithDefaultUnixDevices)
 		if ef := cliContext.String("env-file"); ef != "" {
 			opts = append(opts, oci.WithEnvFile(ef))
 		}
@@ -149,7 +174,7 @@ func NewContainer(ctx context.Context, client *containerd.Client, cliContext *cl
 				return nil, err
 			}
 			if !unpacked {
-				if err := image.Unpack(ctx, snapshotter); err != nil {
+				if err := image.Unpack(ctx, snapshotter, containerd.WithUnpackApplyOpts(diff.WithSyncFs(cliContext.Bool("sync-fs")))); err != nil {
 					return nil, err
 				}
 			}
@@ -175,11 +200,7 @@ func NewContainer(ctx context.Context, client *containerd.Client, cliContext *cl
 				// fuse-overlayfs - https://github.com/containerd/fuse-overlayfs-snapshotter
 				// overlay - in case of idmapped mount points are supported by host kernel (Linux kernel 5.19)
 				if cliContext.Bool("remap-labels") {
-					// TODO: the optimization code path on id mapped mounts only supports single mapping entry today.
-					if len(uidSpec) > 1 || len(gidSpec) > 1 {
-						return nil, errors.New("'remap-labels' option does not support multiple mappings")
-					}
-					cOpts = append(cOpts, containerd.WithNewSnapshot(id, image, containerd.WithRemapperLabels(0, uidSpec[0].HostID, 0, gidSpec[0].HostID, uidSpec[0].Size)))
+					cOpts = append(cOpts, containerd.WithNewSnapshot(id, image, containerd.WithUserNSRemapperLabels(uidSpec, gidSpec)))
 				} else {
 					cOpts = append(cOpts, containerd.WithUserNSRemappedSnapshot(id, image, uidSpec, gidSpec))
 				}
@@ -244,8 +265,8 @@ func NewContainer(ctx context.Context, client *containerd.Client, cliContext *cl
 		}
 
 		if caps := cliContext.StringSlice("cap-add"); len(caps) > 0 {
-			for _, cap := range caps {
-				if !strings.HasPrefix(cap, "CAP_") {
+			for _, c := range caps {
+				if !strings.HasPrefix(c, "CAP_") {
 					return nil, errors.New("capabilities must be specified with 'CAP_' prefix")
 				}
 			}
@@ -253,8 +274,8 @@ func NewContainer(ctx context.Context, client *containerd.Client, cliContext *cl
 		}
 
 		if caps := cliContext.StringSlice("cap-drop"); len(caps) > 0 {
-			for _, cap := range caps {
-				if !strings.HasPrefix(cap, "CAP_") {
+			for _, c := range caps {
+				if !strings.HasPrefix(c, "CAP_") {
 					return nil, errors.New("capabilities must be specified with 'CAP_' prefix")
 				}
 			}
@@ -358,7 +379,7 @@ func NewContainer(ctx context.Context, client *containerd.Client, cliContext *cl
 		if len(cdiDeviceIDs) > 0 {
 			opts = append(opts, withStaticCDIRegistry())
 		}
-		opts = append(opts, oci.WithCDIDevices(cdiDeviceIDs...))
+		opts = append(opts, cdispec.WithCDIDevices(cdiDeviceIDs...))
 
 		rootfsPropagation := cliContext.String("rootfs-propagation")
 		if rootfsPropagation != "" {
@@ -393,6 +414,26 @@ func NewContainer(ctx context.Context, client *containerd.Client, cliContext *cl
 		}
 		if hostname := cliContext.String("hostname"); hostname != "" {
 			opts = append(opts, oci.WithHostname(hostname))
+		}
+		if c := cliContext.String("rlimit-nofile"); c != "" {
+			softS, hardS, found := strings.Cut(c, ":")
+			if !found {
+				hardS = softS
+			}
+			soft, err := strconv.ParseUint(softS, 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse rlimit-nofile %q: %w", c, err)
+			}
+			hard, err := strconv.ParseUint(hardS, 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse rlimit-nofile %q: %w", c, err)
+			}
+			rlimit := &specs.POSIXRlimit{
+				Type: "RLIMIT_NOFILE",
+				Hard: hard,
+				Soft: soft,
+			}
+			opts = append(opts, oci.WithRlimit(rlimit))
 		}
 	}
 
