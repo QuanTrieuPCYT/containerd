@@ -11,16 +11,36 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
+      - name: Clean up disk space
+        run: |
+          df -h
+          sudo rm -rf /usr/share/dotnet \
+            /usr/local/graalvm \
+            /usr/local/.ghcup \
+            /usr/local/share/powershell \
+            /usr/local/share/chromium \
+            /usr/local/share/firefox \
+            /usr/local/lib/android \
+            /usr/local/lib/node_modules \
+            /usr/local/share/podman \
+            /usr/local/aws-cli/ \
+            /usr/local/lib/heroku \
+            /usr/local/rustup \
+            /usr/local/cargo \
+            /usr/local/google-cloud-sdk
+          df -h
+
       - name: Checkout containerd
-        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
         with:
           path: src/github.com/containerd/containerd
 
       - name: Checkout Kubernetes
-        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
         with:
           repository: kubernetes/kubernetes
           path: src/k8s.io/kubernetes
+          fetch-depth: 0
 
       - name: Install Go
         uses: ./src/github.com/containerd/containerd/.github/actions/install-go
@@ -88,12 +108,10 @@ jobs:
       - name: Run Node E2E Tests
         working-directory: ./src/k8s.io/kubernetes
         run: |
-          # TODO: Remove "ResourceMetrics" feature skip once containerd supports ListMetricDescriptors:
-          # https://github.com/kubernetes/kubernetes/blob/v1.33.2/test/e2e_node/resource_metrics_test.go#L67-L71
           sudo make test-e2e-node \
             FOCUS='\[NodeConformance\]|\[Feature:.+\]|\[Feature\]' \
-            SKIP='\[Flaky\]|\[Slow\]|\[Serial\]|\[Feature:UserNamespacesSupport\]|\[Feature:PodLifecycleSleepActionAllowZero\]|\[Feature:UserNamespacesPodSecurityStandards\]|\[Feature:KubeletCredentialProviders\]|\[Feature:LockContention\]|\[Feature:SCTPConnectivity\]|\[Feature:ResourceMetrics\]|\[Alpha\]' \
-            TEST_ARGS='--kubelet-flags="--cgroup-driver=systemd --cgroups-per-qos=true --cgroup-root=/ --runtime-cgroups=/system.slice/containerd.service"'
+            SKIP='\[Flaky\]|\[Slow\]|\[Serial\]|\[Feature:UserNamespacesSupport\]|\[Feature:PodLifecycleSleepActionAllowZero\]|\[Feature:UserNamespacesPodSecurityStandards\]|\[Feature:KubeletCredentialProviders\]|\[Feature:LockContention\]|\[Feature:SCTPConnectivity\]|\[Alpha\]' \
+            TEST_ARGS='--feature-gates=PodAndContainerStatsFromCRI=true --kubelet-flags="--cgroup-driver=systemd --cgroups-per-qos=true --cgroup-root=/ --runtime-cgroups=/system.slice/containerd.service --feature-gates=PodAndContainerStatsFromCRI=true"'
 
       - name: Collect Logs on Failure
         if: failure()
@@ -110,7 +128,7 @@ jobs:
 
       - name: Upload Log Artifacts
         if: failure()
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: e2e-logs
           path: ./_artifacts/

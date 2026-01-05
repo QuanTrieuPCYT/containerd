@@ -409,7 +409,8 @@ type RuntimeConfig struct {
 	// into the OCI config
 	// For more details about CDI and the syntax of CDI Spec files please refer to
 	// https://tags.cncf.io/container-device-interface.
-	EnableCDI bool `toml:"enable_cdi" json:"enableCDI"`
+	// DEPRECATED: CDI support will always be enabled in a future release.
+	EnableCDI *bool `toml:"enable_cdi" json:"enableCDI"`
 	// CDISpecDirs is the list of directories to scan for Container Device Interface Specifications
 	// For more details about CDI configuration please refer to
 	// https://tags.cncf.io/container-device-interface#containerd-configuration
@@ -427,6 +428,19 @@ type RuntimeConfig struct {
 	// IgnoreDeprecationWarnings is the list of the deprecation IDs (such as "io.containerd.deprecation/pull-schema-1-image")
 	// that should be ignored for checking "ContainerdHasNoDeprecationWarnings" condition.
 	IgnoreDeprecationWarnings []string `toml:"ignore_deprecation_warnings" json:"ignoreDeprecationWarnings"`
+
+	// StatsCollectPeriod is the period for collecting container/sandbox CPU stats
+	// used for calculating UsageNanoCores. This matches cAdvisor's default housekeeping interval.
+	// The string is in the golang duration format, see:
+	//   https://golang.org/pkg/time/#ParseDuration
+	// Default: "1s"
+	StatsCollectPeriod string `toml:"stats_collect_period" json:"statsCollectPeriod"`
+
+	// StatsRetentionPeriod is how long to retain CPU stats samples for calculating UsageNanoCores.
+	// The string is in the golang duration format, see:
+	//   https://golang.org/pkg/time/#ParseDuration
+	// Default: "2m"
+	StatsRetentionPeriod string `toml:"stats_retention_period" json:"statsRetentionPeriod"`
 }
 
 // X509KeyPairStreaming contains the x509 configuration for streaming
@@ -669,9 +683,27 @@ func ValidateRuntimeConfig(ctx context.Context, c *RuntimeConfig) ([]deprecation
 			return warnings, fmt.Errorf("invalid `drain_exec_sync_io_timeout`: %w", err)
 		}
 	}
+	// Validation for stats_collect_period
+	if c.StatsCollectPeriod != "" {
+		if _, err := time.ParseDuration(c.StatsCollectPeriod); err != nil {
+			return warnings, fmt.Errorf("invalid `stats_collect_period`: %w", err)
+		}
+	}
+	// Validation for stats_retention_period
+	if c.StatsRetentionPeriod != "" {
+		if _, err := time.ParseDuration(c.StatsRetentionPeriod); err != nil {
+			return warnings, fmt.Errorf("invalid `stats_retention_period`: %w", err)
+		}
+	}
 	if err := ValidateEnableUnprivileged(ctx, c); err != nil {
 		return warnings, err
 	}
+
+	// Validation for enable_cdi
+	if c.EnableCDI != nil && !*c.EnableCDI {
+		warnings = append(warnings, deprecation.CRIEnableCDI)
+	}
+
 	return warnings, nil
 }
 
