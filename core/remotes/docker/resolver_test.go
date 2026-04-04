@@ -37,6 +37,7 @@ import (
 	digest "github.com/opencontainers/go-digest"
 	specs "github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/stretchr/testify/assert"
 
 	"github.com/containerd/containerd/v2/core/remotes"
 	"github.com/containerd/containerd/v2/core/remotes/docker/auth"
@@ -72,7 +73,7 @@ func TestResolverOptionsRace(t *testing.T) {
 		return base, options, s.Close
 	}
 
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		t.Run(fmt.Sprintf("test ResolverOptions race %d", i), func(t *testing.T) {
 			// parallel sub tests so the race condition (if not handled) can be caught
 			// by race detector
@@ -667,6 +668,102 @@ func TestAddQuery(t *testing.T) {
 	}
 }
 
+func TestRequestSanitize(t *testing.T) {
+	tests := []struct {
+		doc      string
+		request  request
+		expected string
+	}{
+		{
+			doc: "no query",
+			request: request{
+				method: http.MethodGet,
+				path:   "/path/v2",
+				host:   RegistryHost{Host: "registry.example.test", Scheme: "https", Path: "/path/v2"},
+			},
+			expected: "https://registry.example.test/path/v2",
+		},
+		{
+			doc: "with query",
+			request: request{
+				method: http.MethodGet,
+				path:   "/path/v2?zzz=123&aaa=456&aaa=789",
+				host:   RegistryHost{Host: "registry.example.test", Scheme: "https", Path: "/path/v2"},
+			},
+			expected: "https://registry.example.test/path/v2?aaa=REDACTED&aaa=REDACTED&zzz=REDACTED",
+		},
+		{
+			doc: "with query namespace preserved",
+			request: request{
+				method: http.MethodGet,
+				path:   "/path/v2?aaa=123&ns=docker.io",
+				host:   RegistryHost{Host: "registry.example.test", Scheme: "https", Path: "/path/v2"},
+			},
+			expected: "https://registry.example.test/path/v2?aaa=REDACTED&ns=docker.io",
+		},
+		{
+			doc: "with empty query values",
+			request: request{
+				method: http.MethodGet,
+				path:   "/path/v2?aaa=&bbb=&bbb",
+				host:   RegistryHost{Host: "registry.example.test", Scheme: "https", Path: "/path/v2"},
+			},
+			expected: "https://registry.example.test/path/v2?aaa=&bbb=&bbb=",
+		},
+		{
+			doc: "with fragment",
+			request: request{
+				method: http.MethodGet,
+				path:   "/path/v2#?zzz=123&aaa=456&aaa=789",
+				host:   RegistryHost{Host: "registry.example.test", Scheme: "https", Path: "/path/v2"},
+			},
+			expected: "https://registry.example.test/path/v2#?zzz=123&aaa=456&aaa=789",
+		},
+		{
+			doc: "with auth",
+			request: request{
+				method: http.MethodGet,
+				path:   "/path/v2",
+				host:   RegistryHost{Host: "user:pass@registry.example.test", Scheme: "https", Path: "/path/v2"},
+			},
+			expected: "https://user:xxxxx@registry.example.test/path/v2",
+		},
+		{
+			doc: "with auth and query",
+			request: request{
+				method: http.MethodGet,
+				path:   "/path/v2?zzz=123&aaa=456&aaa=789",
+				host:   RegistryHost{Host: "user:pass@registry.example.test", Scheme: "https", Path: "/path/v2"},
+			},
+			expected: "https://user:xxxxx@registry.example.test/path/v2?aaa=REDACTED&aaa=REDACTED&zzz=REDACTED",
+		},
+		{
+			doc: "with auth and fragment",
+			request: request{
+				method: http.MethodGet,
+				path:   "/path/v2#?zzz=123&aaa=456&aaa=789",
+				host:   RegistryHost{Host: "user:pass@registry.example.test", Scheme: "https", Path: "/path/v2"},
+			},
+			expected: "https://user:xxxxx@registry.example.test/path/v2#?zzz=123&aaa=456&aaa=789",
+		},
+		{
+			doc: "malformed missing protocol scheme",
+			request: request{
+				method: http.MethodGet,
+				path:   "/path/v2?aaa=123&bbb=456&bbb=789",
+				host:   RegistryHost{Host: "registry.example.test", Scheme: "", Path: "/path/v2"},
+			},
+			expected: "://registry.example.test/path/v2?aaa=123&bbb=456&bbb=789",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.doc, func(t *testing.T) {
+			assert.Equal(t, tc.expected, tc.request.sanitizedURL())
+		})
+	}
+}
+
 func flipLocalhost(host string) string {
 	if strings.HasPrefix(host, "127.0.0.1") {
 		return "localhost" + host[9:]
@@ -784,7 +881,7 @@ func (h logHandler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 type namespaceRouter map[string]http.Handler
 
 func (nr namespaceRouter) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
-	h, ok := nr[r.URL.Query().Get("ns")]
+	h, ok := nr[r.URL.Query().Get(namespaceQueryArg)]
 	if !ok {
 		rw.WriteHeader(http.StatusNotFound)
 		return
@@ -878,7 +975,7 @@ func testFetch(ctx context.Context, f remotes.Fetcher, desc ocispec.Descriptor) 
 	}
 	r2, desc2, err := fByDigest.FetchByDigest(ctx, desc.Digest)
 	if err != nil {
-		return fmt.Errorf("FetcherByDigest: faild to fetch %v: %w", desc.Digest, err)
+		return fmt.Errorf("FetcherByDigest: failed to fetch %v: %w", desc.Digest, err)
 	}
 	if desc2.Size != desc.Size {
 		r2b, err := io.ReadAll(r2)
@@ -889,7 +986,7 @@ func testFetch(ctx context.Context, f remotes.Fetcher, desc ocispec.Descriptor) 
 	}
 	dgstr2 := desc.Digest.Algorithm().Digester()
 	if _, err = io.Copy(dgstr2.Hash(), r2); err != nil {
-		return fmt.Errorf("FetcherByDigest: faild to copy: %w", err)
+		return fmt.Errorf("FetcherByDigest: failed to copy: %w", err)
 	}
 	if dgstr2.Digest() != desc.Digest {
 		return fmt.Errorf("FetcherByDigest: content mismatch: %s != %s", dgstr2.Digest(), desc.Digest)
@@ -1004,6 +1101,138 @@ func (m testManifest) OCIManifest() []byte {
 func (m testManifest) RegisterHandler(r *http.ServeMux, name string) {
 	for _, c := range append(m.references, m.config) {
 		r.Handle(fmt.Sprintf("/v2/%s/blobs/%s", name, c.Digest()), c)
+	}
+}
+
+// TestResolveTransientManifestError verifies that a transient server error (5xx)
+// from the /manifests/ endpoint does NOT cause containerd to fall back to the
+// /blobs/ endpoint. Before this fix, a 500 from /manifests/ would cause Resolve()
+// to silently retry via /blobs/, which returns "application/octet-stream" instead
+// of a proper manifest media type — poisoning the descriptor and corrupting the
+// local content store.
+//
+// The correct behavior is: 5xx from /manifests/ → return the server error, do NOT
+// try /blobs/.
+func TestResolveTransientManifestError(t *testing.T) {
+	var (
+		manifestCalled int
+		blobsCalled    bool
+		repo           = "test-repo"
+		dgst           = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" // empty sha
+	)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/manifests/"+dgst) {
+			manifestCalled++
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/blobs/"+dgst) {
+			blobsCalled = true
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Header().Set("Docker-Content-Digest", dgst)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.URL.Path == "/v2/" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	resolver := NewResolver(ResolverOptions{
+		Hosts: func(string) ([]RegistryHost, error) {
+			return []RegistryHost{
+				{
+					Host:         ts.URL[len("http://"):],
+					Scheme:       "http",
+					Capabilities: HostCapabilityPull | HostCapabilityResolve,
+				},
+			}, nil
+		},
+	})
+
+	ref := fmt.Sprintf("%s/%s@%s", ts.URL[len("http://"):], repo, dgst)
+	_, _, err := resolver.Resolve(context.Background(), ref)
+
+	if manifestCalled == 0 {
+		t.Fatal("manifests endpoint was not called")
+	}
+	if blobsCalled {
+		t.Error("blobs endpoint was called, but should not have been after a 500 on /manifests/")
+	}
+	if err == nil {
+		t.Fatal("expected error from Resolve, but got nil")
+	}
+
+	// The error should surface the unexpected 500 status, not a generic "not found".
+	var unexpectedStatus remoteerrors.ErrUnexpectedStatus
+	if !errors.As(err, &unexpectedStatus) {
+		t.Errorf("expected ErrUnexpectedStatus (from 500), got %T: %v", err, err)
+	} else if unexpectedStatus.StatusCode != http.StatusInternalServerError {
+		t.Errorf("expected status 500, got %d", unexpectedStatus.StatusCode)
+	}
+}
+
+// TestResolve404ManifestFallback verifies that a 404 from /manifests/ DOES
+// allow fallback to /blobs/. This preserves backward compatibility with
+// non-standard registries that may only serve certain digests via /blobs/.
+func TestResolve404ManifestFallback(t *testing.T) {
+	var (
+		manifestCalled bool
+		blobsCalled    bool
+		repo           = "test-repo"
+		dgst           = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/manifests/"+dgst) {
+			manifestCalled = true
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/blobs/"+dgst) {
+			blobsCalled = true
+			w.Header().Set("Content-Type", "application/vnd.docker.distribution.manifest.v2+json")
+			w.Header().Set("Docker-Content-Digest", dgst)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.URL.Path == "/v2/" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+	}))
+	defer ts.Close()
+
+	resolver := NewResolver(ResolverOptions{
+		Hosts: func(string) ([]RegistryHost, error) {
+			return []RegistryHost{
+				{
+					Host:         ts.URL[len("http://"):],
+					Scheme:       "http",
+					Capabilities: HostCapabilityPull | HostCapabilityResolve,
+				},
+			}, nil
+		},
+	})
+
+	ref := fmt.Sprintf("%s/%s@%s", ts.URL[len("http://"):], repo, dgst)
+	_, desc, err := resolver.Resolve(context.Background(), ref)
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !manifestCalled {
+		t.Error("manifests endpoint was not called")
+	}
+	if !blobsCalled {
+		t.Error("blobs endpoint was not called on 404")
+	}
+	if desc.MediaType != "application/vnd.docker.distribution.manifest.v2+json" {
+		t.Errorf("unexpected media type: %s", desc.MediaType)
 	}
 }
 

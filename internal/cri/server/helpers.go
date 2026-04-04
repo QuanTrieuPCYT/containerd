@@ -53,6 +53,8 @@ const (
 	completeExitReason = "Completed"
 	// errorExitReason is the exit reason when container exits with code non-zero.
 	errorExitReason = "Error"
+	// oomExitCodeInLinux is the exit code (137) returned when a process is terminated by the Linux OOM killer.
+	oomExitCodeInLinux = 137
 	// oomExitReason is the exit reason when process in container is oom killed.
 	oomExitReason = "OOMKilled"
 
@@ -232,7 +234,7 @@ func filterLabel(k, v string) string {
 }
 
 // getRuntimeOptions get runtime options from container metadata.
-func getRuntimeOptions(c containers.Container) (interface{}, error) {
+func getRuntimeOptions(c containers.Container) (any, error) {
 	from := c.Runtime.Options
 	if from == nil || from.GetValue() == nil {
 		return nil, nil

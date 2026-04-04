@@ -34,14 +34,12 @@ package setutils
 
 import (
 	"cmp"
+	"slices"
 	"sort"
 )
 
 // Set is a set of the same type elements, implemented via map[comparable]struct{} for minimal memory consumption.
 type Set[T comparable] map[T]Empty
-
-// cast transforms specified set to generic Set[T].
-func cast[T comparable](s map[T]Empty) Set[T] { return s }
 
 // New creates a Set from a list of values.
 // NOTE: type param must be explicitly instantiated if given items are empty.
@@ -107,12 +105,7 @@ func (s Set[T]) HasAll(items ...T) bool {
 
 // HasAny returns true if any items are contained in the set.
 func (s Set[T]) HasAny(items ...T) bool {
-	for _, item := range items {
-		if s.Has(item) {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(items, s.Has)
 }
 
 // Clone returns a new set which is a copy of the current set.

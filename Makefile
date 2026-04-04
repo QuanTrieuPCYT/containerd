@@ -18,7 +18,7 @@ GO ?= go
 INSTALL ?= install
 
 # Root directory of the project (absolute path).
-ROOTDIR=$(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+ROOTDIR := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
 
 # Base path used to install.
 # The files will be installed under `$(DESTDIR)/$(PREFIX)`.
@@ -88,7 +88,7 @@ COMMANDS=ctr containerd containerd-stress
 MANPAGES=ctr.8 containerd.8 containerd-config.8 containerd-config.toml.5
 
 ifdef BUILDTAGS
-    GO_BUILDTAGS = ${BUILDTAGS}
+	GO_BUILDTAGS = ${BUILDTAGS}
 endif
 GO_BUILDTAGS ?=
 GO_BUILDTAGS += urfave_cli_no_docs
@@ -111,25 +111,26 @@ GO_LDFLAGS+='
 SHIM_GO_LDFLAGS=-ldflags '-X $(PKG)/version.Version=$(VERSION) -X $(PKG)/version.Revision=$(REVISION) -X $(PKG)/version.Package=$(PACKAGE) -extldflags "-static" $(EXTRA_LDFLAGS)'
 
 # Project packages.
-PACKAGES=$(shell $(GO) list ${GO_TAGS} ./... | grep -v /vendor/ | grep -v /integration)
-API_PACKAGES=$(shell (cd api && $(GO) list ${GO_TAGS} ./... | grep -v /vendor/ | grep -v /integration))
-TEST_REQUIRES_ROOT_PACKAGES=$(filter \
-    ${PACKAGES}, \
-    $(shell \
-	for f in $$(git grep -l testutil.RequiresRoot | grep -v Makefile); do \
-		d="$$(dirname $$f)"; \
-		[ "$$d" = "." ] && echo "${PKG}" && continue; \
-		echo "${PKG}/$$d"; \
-	done | sort -u) \
-    )
+PACKAGES := $(shell $(GO) list ${GO_TAGS} ./... | grep -v /integration)
+API_PACKAGES := $(shell $(GO) -C api list ${GO_TAGS} ./...)
+
+TEST_REQUIRES_ROOT_PACKAGES := $(filter \
+	${PACKAGES}, \
+	$(shell \
+		for f in $$(git grep -l testutil.RequiresRoot | grep -v Makefile); do \
+			d="$$(dirname $$f)"; \
+			[ "$$d" = "." ] && echo "${PKG}" && continue; \
+			echo "${PKG}/$$d"; \
+		done | sort -u) \
+	)
 
 ifdef SKIPTESTS
-    PACKAGES:=$(filter-out ${SKIPTESTS},${PACKAGES})
-    TEST_REQUIRES_ROOT_PACKAGES:=$(filter-out ${SKIPTESTS},${TEST_REQUIRES_ROOT_PACKAGES})
+	PACKAGES := $(filter-out ${SKIPTESTS},${PACKAGES})
+	TEST_REQUIRES_ROOT_PACKAGES := $(filter-out ${SKIPTESTS},${TEST_REQUIRES_ROOT_PACKAGES})
 endif
 
-#Replaces ":" (*nix), ";" (windows) with newline for easy parsing
-GOPATHS=$(shell $(GO) env GOPATH | tr ":" "\n" | tr ";" "\n")
+# Replaces ":" (*nix), ";" (windows) with newline for easy parsing
+GOPATHS := $(shell $(GO) env GOPATH | tr ":" "\n" | tr ";" "\n")
 
 TESTFLAGS_RACE=
 GO_BUILD_FLAGS ?=
@@ -178,34 +179,26 @@ generate: protos
 
 protos: bin/protoc-gen-go-fieldpath bin/go-buildtag
 	@echo "$(WHALE) $@"
-	@find . -path ./vendor -prune -false -o -name '*.pb.go' | xargs rm
-	$(eval TMPDIR := $(shell mktemp -d))
-	@mv ${ROOTDIR}/vendor ${TMPDIR}
-	@(cd ${ROOTDIR}/api && PATH="${ROOTDIR}/bin:${PATH}" protobuild --quiet ${API_PACKAGES})
-	@mv ${TMPDIR}/vendor ${ROOTDIR}
-	@rm -rf ${TMPDIR} v2
-	go-fix-acronym -w -a '^Os' $(shell find api/ -name '*.pb.go')
-	go-fix-acronym -w -a '(Id|Io|Uuid|Os)$$' $(shell find api/ -name '*.pb.go')
-	bin/go-buildtag -w --tags '!no_grpc' $(shell find api/ -name '*_grpc.pb.go')
-	@test -z "$$(git status --short | grep "api/next.pb.txt" | tee /dev/stderr)" || \
+	(cd api && buf dep update)
+	(cd api && PATH="$(ROOTDIR)/bin:$$PATH" buf generate)
+	(cd api && buf build -o next.txtpb)
+	@rm -f api/runtime/task/v2/shim_grpc.pb.go api/services/ttrpc/events/v1/events_grpc.pb.go
+	@find api/ -name '*_fieldpath.pb.go' ! -path 'api/events/*' -delete
+	go-fix-acronym -w -a '^Os' $$(find api/ -name '*.pb.go')
+	go-fix-acronym -w -a '(Id|Io|Uuid|Os)$$' $$(find api/ -name '*.pb.go')
+	bin/go-buildtag -w --tags '!no_grpc' $$(find api/ -name '*_grpc.pb.go')
+	@test -z "$$(git status --short | grep "api/next.txtpb" | tee /dev/stderr)" || \
 		$(GO) mod edit -replace=github.com/containerd/containerd/api=./api
 
-check-protos: protos ## check if protobufs needs to be generated again
+check-protos: ## check if protobufs needs to be generated again
 	@echo "$(WHALE) $@"
-	@test -z "$$(git status --short | grep ".pb.go" | tee /dev/stderr)" || \
-		((git diff | cat) && \
-		(echo "$(ONI) please run 'make protos' when making changes to proto files" && false))
+	@(cd api && buf format --diff --exit-code --exclude-path vendor \
+		$(if $(GITHUB_ACTIONS),--error-format github-actions)) || \
+		(echo "$(ONI) please run 'make protos' when making changes to proto files" && false)
 
-check-api-descriptors: protos ## check that protobuf changes aren't present.
+proto-fmt: ## format proto files
 	@echo "$(WHALE) $@"
-	@test -z "$$(git status --short | grep ".pb.txt" | tee /dev/stderr)" || \
-		((git diff $$(find . -name '*.pb.txt') | cat) && \
-		(echo "$(ONI) please run 'make protos' when making changes to proto files and check-in the generated descriptor file changes" && false))
-
-proto-fmt: ## check format of proto files
-	@echo "$(WHALE) $@"
-	@test -z "$$(find . -path ./vendor -prune -o -path ./protobuf/google/rpc -prune -o -name '*.proto' -type f -exec grep -Hn -e "^ " {} \; | tee /dev/stderr)" || \
-		(echo "$(ONI) please indent proto files with tabs only" && false)
+	@cd api && buf format --write --exclude-path vendor
 
 build: ## build the go packages
 	@echo "$(WHALE) $@"
@@ -221,7 +214,9 @@ root-test: ## run tests, except integration tests
 
 integration: ## run integration tests
 	@echo "$(WHALE) $@"
-	@cd "${ROOTDIR}/integration/client" && $(GO) mod download && $(GOTEST) -v ${TESTFLAGS} -test.root -parallel ${TESTFLAGS_PARALLEL} .
+	@$(GO) -C "${ROOTDIR}/integration/client" mod download
+	@cd "${ROOTDIR}/integration/client" && \
+		$(GOTEST) -v ${TESTFLAGS} -test.root -parallel ${TESTFLAGS_PARALLEL} .
 
 bin/cri-integration.test:
 	@echo "$(WHALE) $@"
@@ -495,16 +490,16 @@ vendor: ## ensure all the go.mod/go.sum files are up-to-date including vendor/ d
 	@$(GO) mod tidy
 	@$(GO) mod vendor
 	@$(GO) mod verify
-	@(cd ${ROOTDIR}/api && ${GO} mod tidy)
+	@$(GO) -C ${ROOTDIR}/api mod tidy
 
 verify-vendor: ## verify if all the go.mod/go.sum files are up-to-date
 	@echo "$(WHALE) $@"
 	$(eval TMPDIR := $(shell mktemp -d))
 	@cp -R ${ROOTDIR} ${TMPDIR}
-	@(cd ${TMPDIR}/containerd && ${GO} mod tidy)
-	@(cd ${TMPDIR}/containerd && ${GO} mod vendor)
-	@(cd ${TMPDIR}/containerd && ${GO} mod verify)
-	@(cd ${TMPDIR}/containerd/api && ${GO} mod tidy)
+	@$(GO) -C ${TMPDIR}/containerd mod tidy
+	@$(GO) -C ${TMPDIR}/containerd mod vendor
+	@$(GO) -C ${TMPDIR}/containerd mod verify
+	@$(GO) -C ${TMPDIR}/containerd/api mod tidy
 	@diff -r -u -q ${ROOTDIR} ${TMPDIR}/containerd
 	@rm -rf ${TMPDIR}
 

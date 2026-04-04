@@ -28,10 +28,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"iter"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"time"
 
 	"dario.cat/mergo"
 	"github.com/pelletier/go-toml/v2"
@@ -78,7 +81,7 @@ type Config struct {
 	// RequiredPlugins must use a fully qualified plugin URI.
 	RequiredPlugins []string `toml:"required_plugins"`
 	// Plugins provides plugin specific configuration for the initialization of a plugin
-	Plugins map[string]interface{} `toml:"plugins"`
+	Plugins map[string]any `toml:"plugins"`
 	// OOMScore adjust the containerd's oom score
 	OOMScore int `toml:"oom_score"`
 	// Cgroup specifies cgroup information for the containerd daemon process
@@ -187,7 +190,7 @@ func v1MigratePluginName(ctx context.Context, plugin string) string {
 }
 
 func v1Migrate(ctx context.Context, c *Config) error {
-	plugins := make(map[string]interface{}, len(c.Plugins))
+	plugins := make(map[string]any, len(c.Plugins))
 	for plugin, value := range c.Plugins {
 		plugins[v1MigratePluginName(ctx, plugin)] = value
 	}
@@ -230,7 +233,8 @@ type Debug struct {
 	GID     int    `toml:"gid"`
 	Level   string `toml:"level"`
 	// Format represents the logging format. Supported values are 'text' and 'json'.
-	Format string `toml:"format"`
+	Format     string `toml:"format"`
+	LogTraceID bool   `toml:"log_trace_id"`
 }
 
 // MetricsConfig provides metrics configuration
@@ -254,7 +258,7 @@ type ProxyPlugin struct {
 }
 
 // Decode unmarshals a plugin specific configuration by plugin id
-func (c *Config) Decode(ctx context.Context, id string, config interface{}) (interface{}, error) {
+func (c *Config) Decode(ctx context.Context, id string, config any) (any, error) {
 	data, ok := c.Plugins[id]
 	if !ok {
 		return config, nil
@@ -287,13 +291,23 @@ func (c *Config) Decode(ctx context.Context, id string, config interface{}) (int
 
 // LoadConfig loads the containerd server config from the provided path
 func LoadConfig(ctx context.Context, path string, out *Config) error {
+	return LoadConfigWithPlugins(ctx, path, nil, out)
+}
+
+// PluginFunc returns an iterator to the plugin registrations
+type PluginFunc func() iter.Seq[plugin.Registration]
+
+// LoadConfigWithPlugins loads the containerd server config from the provided path
+// and using the migration functions from the provided plugins.
+func LoadConfigWithPlugins(ctx context.Context, path string, plugins PluginFunc, out *Config) error {
 	if out == nil {
 		return fmt.Errorf("argument out must not be nil: %w", errdefs.ErrInvalidArgument)
 	}
 
 	var (
-		loaded  = map[string]bool{}
-		pending = []string{path}
+		loaded            = map[string]bool{}
+		pending           = []string{path}
+		rootConfigVersion = 0
 	)
 
 	for len(pending) > 0 {
@@ -309,13 +323,37 @@ func LoadConfig(ctx context.Context, path string, out *Config) error {
 			return err
 		}
 
-		switch config.Version {
-		case 0, 1:
-			if err := config.MigrateConfigTo(ctx, out.Version); err != nil {
-				return err
+		// Check to make sure drop-in configs does not have a higher version than the root config version
+		if rootConfigVersion == 0 {
+			rootConfigVersion = config.Version
+		}
+		if config.Version > rootConfigVersion {
+			return fmt.Errorf("drop-in config version %d higher than root config version %d", config.Version, rootConfigVersion)
+		}
+
+		if config.Version < out.Version {
+			var (
+				currentVersion = config.Version
+				t1             = time.Now()
+			)
+			for v := currentVersion; v < out.Version; v++ {
+				if err := config.MigrateConfigTo(ctx, v+1); err != nil {
+					return err
+				}
+				if plugins != nil {
+					// Run migration for each configuration version
+					// Run each plugin migration for each version to ensure that migration logic is simple and
+					// focused on upgrading from one version at a time.
+					for p := range plugins() {
+						if p.ConfigMigration != nil {
+							if err := p.ConfigMigration(ctx, v, config.Plugins); err != nil {
+								return err
+							}
+						}
+					}
+				}
 			}
-		default:
-			// NOP
+			log.G(ctx).WithField("t", time.Since(t1)).Warnf("Configuration migrated from version %d, use `containerd config migrate` to avoid migration", currentVersion)
 		}
 
 		if err := mergeConfig(out, config); err != nil {
@@ -433,17 +471,11 @@ func mergeConfig(to, from *Config) error {
 	}
 
 	// Replace entire sections instead of merging map's values.
-	for k, v := range from.StreamProcessors {
-		to.StreamProcessors[k] = v
-	}
+	maps.Copy(to.StreamProcessors, from.StreamProcessors)
 
-	for k, v := range from.ProxyPlugins {
-		to.ProxyPlugins[k] = v
-	}
+	maps.Copy(to.ProxyPlugins, from.ProxyPlugins)
 
-	for k, v := range from.Timeouts {
-		to.Timeouts[k] = v
-	}
+	maps.Copy(to.Timeouts, from.Timeouts)
 
 	return nil
 }

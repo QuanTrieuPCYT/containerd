@@ -375,7 +375,7 @@ func execToExistingContainer(t *testing.T, _ int,
 
 		logSizeChange := false
 		curSize := getFileSize(t, logPath)
-		for i := 0; i < 30; i++ {
+		for range 30 {
 			time.Sleep(1 * time.Second)
 
 			if curSize < getFileSize(t, logPath) {
@@ -559,7 +559,7 @@ func shouldParseMetricDataCorrectly(t *testing.T, _ int,
 	scriptInHost := filepath.Join(scriptVolume, "run.sh")
 
 	fileSize := 1024 * 1024 * 96 // 96 MiB
-	require.NoError(t, os.WriteFile(scriptInHost, []byte(fmt.Sprintf(`#!/bin/sh
+	require.NoError(t, os.WriteFile(scriptInHost, fmt.Appendf(nil, `#!/bin/sh
 set -euo pipefail
 
 head -c %d </dev/urandom >/tmp/log
@@ -576,7 +576,6 @@ while true; do
   sleep 1
 done
 `, fileSize,
-	),
 	), 0600))
 
 	podLogDir := t.TempDir()
@@ -632,7 +631,6 @@ func newPodTCtx(t *testing.T, rSvc cri.RuntimeService,
 func newPodTCtxWithRuntimeHandler(t *testing.T, rSvc cri.RuntimeService,
 	name, ns, runtimeHandler string, opts ...PodSandboxOpts) *podTCtx {
 
-	t.Logf("Run a sandbox %s in namespace %s with runtimeHandler %s", name, ns, runtimeHandler)
 	sbConfig := PodSandboxConfig(name, ns, opts...)
 	sbID, err := rSvc.RunPodSandbox(sbConfig, runtimeHandler)
 	require.NoError(t, err)
@@ -661,7 +659,6 @@ type podTCtx struct {
 func (pCtx *podTCtx) createContainer(name, imageRef string, wantedState criruntime.ContainerState, opts ...ContainerOpts) string {
 	t := pCtx.t
 
-	t.Logf("Create a container %s (wantedState: %s) in pod %s", name, wantedState, pCtx.name)
 	cfg := ContainerConfig(name, imageRef, opts...)
 	cnID, err := pCtx.rSvc.CreateContainer(pCtx.id, cfg, pCtx.cfg)
 	require.NoError(t, err)
@@ -738,7 +735,7 @@ func buildShimClientFromBundle(t *testing.T, rSvc cri.RuntimeService, cid string
 	case err == nil:
 		rawJSON, err := os.ReadFile(bootstrapJSON)
 		require.NoError(t, err, "failed to read bootstrap.json for container %s", cid)
-		var bootstrapData map[string]interface{}
+		var bootstrapData map[string]any
 		err = json.Unmarshal(rawJSON, &bootstrapData)
 		require.NoError(t, err, "failed to unmarshal bootstrap.json for container %s", cid)
 
@@ -796,11 +793,11 @@ func (pCtx *podTCtx) stop(remove bool) {
 }
 
 // criRuntimeInfo dumps CRI config.
-func criRuntimeInfo(t *testing.T, svc cri.RuntimeService) map[string]interface{} {
+func criRuntimeInfo(t *testing.T, svc cri.RuntimeService) map[string]any {
 	resp, err := svc.Status()
 	require.NoError(t, err)
 
-	cfg := map[string]interface{}{}
+	cfg := map[string]any{}
 	err = json.Unmarshal([]byte(resp.GetInfo()["config"]), &cfg)
 	require.NoError(t, err)
 

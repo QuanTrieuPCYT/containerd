@@ -33,6 +33,7 @@ import (
 	"github.com/containerd/containerd/v2/internal/cri/constants"
 	"github.com/containerd/containerd/v2/internal/cri/instrument"
 	"github.com/containerd/containerd/v2/internal/cri/server"
+	"github.com/containerd/containerd/v2/internal/cri/server/images"
 	nriservice "github.com/containerd/containerd/v2/internal/nri"
 	"github.com/containerd/containerd/v2/plugins"
 	"github.com/containerd/containerd/v2/plugins/services/warning"
@@ -64,7 +65,7 @@ func init() {
 	})
 }
 
-func initCRIService(ic *plugin.InitContext) (interface{}, error) {
+func initCRIService(ic *plugin.InitContext) (any, error) {
 	ctx := ic.Context
 	config := ic.Config.(*criconfig.ServerConfig)
 
@@ -78,6 +79,22 @@ func initCRIService(ic *plugin.InitContext) (interface{}, error) {
 	criImagePlugin, err := ic.GetByID(plugins.CRIServicePlugin, "images")
 	if err != nil {
 		return nil, fmt.Errorf("unable to load CRI image service plugin dependency: %w", err)
+	}
+
+	// Propagate runtime-specific snapshotters from runtime config to image service.
+	// This is needed because users may configure snapshotters in the runtime config
+	// (containerd.runtimes.<name>.snapshotter) which the image service needs for pulling.
+	runtimeSvc := criRuntimePlugin.(server.RuntimeService)
+	imageSvc := criImagePlugin.(server.ImageService)
+	runtimeConfig := runtimeSvc.Config()
+	for runtimeName, rt := range runtimeConfig.Runtimes {
+		if rt.Snapshotter != "" {
+			imagePlatform := images.ImagePlatform{
+				Snapshotter: rt.Snapshotter,
+				Platform:    platforms.DefaultSpec(),
+			}
+			imageSvc.UpdateRuntimeSnapshotter(runtimeName, imagePlatform)
+		}
 	}
 
 	if warnings, err := criconfig.ValidateServerConfig(ic.Context, config); err != nil {
@@ -115,8 +132,8 @@ func initCRIService(ic *plugin.InitContext) (interface{}, error) {
 	}
 
 	options := &server.CRIServiceOptions{
-		RuntimeService:     criRuntimePlugin.(server.RuntimeService),
-		ImageService:       criImagePlugin.(server.ImageService),
+		RuntimeService:     runtimeSvc,
+		ImageService:       imageSvc,
 		StreamingConfig:    streamingConfig,
 		NRI:                getNRIAPI(ic),
 		Client:             client,
@@ -236,17 +253,17 @@ func getSandboxControllers(ic *plugin.InitContext) (map[string]sandbox.Controlle
 	return sc, nil
 }
 
-func configMigration(ctx context.Context, configVersion int, pluginConfigs map[string]interface{}) error {
+func configMigration(ctx context.Context, configVersion int, pluginConfigs map[string]any) error {
 	if configVersion >= version.ConfigVersion {
 		return nil
 	}
 	const pluginName = string(plugins.GRPCPlugin) + ".cri"
-	src, ok := pluginConfigs[pluginName].(map[string]interface{})
+	src, ok := pluginConfigs[pluginName].(map[string]any)
 	if !ok {
 		return nil
 	}
 
-	dst := map[string]interface{}{}
+	dst := map[string]any{}
 	for _, k := range []string{
 		"disable_tcp_service",
 		"stream_server_address",

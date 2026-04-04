@@ -68,7 +68,9 @@ func (c *criService) podSandboxStats(
 		if err != nil {
 			return nil, fmt.Errorf("failed to get usage nano cores: %w", err)
 		}
-		cpuStats.UsageNanoCores = &runtime.UInt64Value{Value: nanoUsage}
+		if nanoUsage != nil {
+			cpuStats.UsageNanoCores = &runtime.UInt64Value{Value: *nanoUsage}
+		}
 	}
 	podSandboxStats.Linux.Cpu = cpuStats
 
@@ -201,7 +203,7 @@ func cgroupMetricsForSandbox(sandbox sandboxstore.Sandbox) (*cgroupMetrics, erro
 		if err != nil {
 			return nil, fmt.Errorf("failed to load sandbox cgroup: %v: %w", cgroupPath, err)
 		}
-		stats, err := cg.Stat()
+		stats, err := cg.StatFiltered(cgroupsv2.StatCPU | cgroupsv2.StatMemory)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get stats for cgroup: %v: %w", cgroupPath, err)
 		}

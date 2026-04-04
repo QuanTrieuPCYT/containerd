@@ -32,6 +32,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
 
+	"github.com/containerd/containerd/v2/internal/cri/server/images"
 	containerstore "github.com/containerd/containerd/v2/internal/cri/store/container"
 	imagestore "github.com/containerd/containerd/v2/internal/cri/store/image"
 )
@@ -85,6 +86,7 @@ func getContainerStatusTestData(t *testing.T) (*containerstore.Metadata, contain
 		CreatedAt:   createdAt,
 		Image:       &runtime.ImageSpec{Image: "gcr.io/library/busybox:latest"},
 		ImageRef:    "gcr.io/library/busybox@sha256:e6693c20186f837fc393390135d8a598a96a833917917789d63766cab6c59582",
+		ImageId:     imageID,
 		Reason:      completeExitReason,
 		Labels:      config.GetLabels(),
 		Annotations: config.GetAnnotations(),
@@ -170,7 +172,8 @@ func TestToCRIContainerStatus(t *testing.T) {
 			containerStatus, err := toCRIContainerStatus(context.Background(),
 				container,
 				expected.Image,
-				expected.ImageRef)
+				expected.ImageRef,
+				expected.ImageId)
 			assert.Nil(t, err)
 			assert.Equal(t, expected, containerStatus, test.desc)
 		})
@@ -300,8 +303,15 @@ func (s *fakeImageService) LocalResolve(refOrID string) (imagestore.Image, error
 
 func (s *fakeImageService) ImageFSPaths() map[string]string { return make(map[string]string) }
 
+func (s *fakeImageService) Config() criconfig.ImageConfig {
+	return criconfig.ImageConfig{}
+}
+
 func (s *fakeImageService) PullImage(context.Context, string, func(string) (string, string, error), *runtime.PodSandboxConfig, string) (string, error) {
 	return "", errors.New("not implemented")
+}
+
+func (s *fakeImageService) UpdateRuntimeSnapshotter(runtimeName string, imagePlatform images.ImagePlatform) {
 }
 
 func patchExceptedWithState(expected *runtime.ContainerStatus, state runtime.ContainerState) {

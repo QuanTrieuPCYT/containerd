@@ -42,12 +42,12 @@ import (
 	criconfig "github.com/containerd/containerd/v2/internal/cri/config"
 	"github.com/containerd/containerd/v2/internal/cri/nri"
 	"github.com/containerd/containerd/v2/internal/cri/server/events"
+	"github.com/containerd/containerd/v2/internal/cri/server/images"
 	containerstore "github.com/containerd/containerd/v2/internal/cri/store/container"
 	imagestore "github.com/containerd/containerd/v2/internal/cri/store/image"
 	"github.com/containerd/containerd/v2/internal/cri/store/label"
 	sandboxstore "github.com/containerd/containerd/v2/internal/cri/store/sandbox"
 	snapshotstore "github.com/containerd/containerd/v2/internal/cri/store/snapshot"
-	streaming "github.com/containerd/containerd/v2/internal/cri/streamingserver"
 	ctrdutil "github.com/containerd/containerd/v2/internal/cri/util"
 	"github.com/containerd/containerd/v2/internal/eventq"
 	nriservice "github.com/containerd/containerd/v2/internal/nri"
@@ -56,6 +56,7 @@ import (
 	"github.com/containerd/containerd/v2/pkg/oci"
 	osinterface "github.com/containerd/containerd/v2/pkg/os"
 	"github.com/containerd/containerd/v2/plugins"
+	streaming "k8s.io/cri-streaming/pkg/streaming"
 )
 
 var kernelSupportsRRO bool
@@ -77,6 +78,7 @@ type sandboxService interface {
 	CreateSandbox(ctx context.Context, info sandbox.Sandbox, opts ...sandbox.CreateOpt) error
 	StartSandbox(ctx context.Context, sandboxer string, sandboxID string) (sandbox.ControllerInstance, error)
 	WaitSandbox(ctx context.Context, sandboxer string, sandboxID string) (<-chan containerd.ExitStatus, error)
+	UpdateSandbox(ctx context.Context, sandboxer string, sandboxID string, sandbox sandbox.Sandbox, fields ...string) error
 	StopSandbox(ctx context.Context, sandboxer, sandboxID string, opts ...sandbox.StopOpt) error
 	ShutdownSandbox(ctx context.Context, sandboxer string, sandboxID string) error
 	SandboxStatus(ctx context.Context, sandboxer string, sandboxID string, verbose bool) (sandbox.ControllerStatus, error)
@@ -108,6 +110,10 @@ type ImageService interface {
 	LocalResolve(refOrID string) (imagestore.Image, error)
 
 	ImageFSPaths() map[string]string
+
+	Config() criconfig.ImageConfig
+
+	UpdateRuntimeSnapshotter(runtimeName string, imagePlatform images.ImagePlatform)
 }
 
 // criService implements CRIService.

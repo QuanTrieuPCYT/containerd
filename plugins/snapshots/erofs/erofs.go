@@ -33,7 +33,9 @@ import (
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/core/snapshots/storage"
+	"github.com/containerd/containerd/v2/internal/dmverity"
 	"github.com/containerd/containerd/v2/internal/fsverity"
+	"github.com/containerd/containerd/v2/internal/userns"
 )
 
 // SnapshotterConfig is used to configure the erofs snapshotter instance
@@ -48,6 +50,9 @@ type SnapshotterConfig struct {
 	defaultSize int64
 	// fsMergeThreshold (>0) enables fsmerge when the number of image layers exceeds this value
 	fsMergeThreshold uint
+	remapIDs         bool
+	// dmverityMode controls dm-verity behavior: "auto" (use if .dmverity exists), "on" (require .dmverity), "off" (disable)
+	dmverityMode string
 }
 
 // Opt is an option to configure the erofs snapshotter
@@ -74,6 +79,13 @@ func WithImmutable() Opt {
 	}
 }
 
+// WithDmverityMode sets the dm-verity mode: "auto" (default), "on" (required), or "off" (disabled)
+func WithDmverityMode(mode string) Opt {
+	return func(config *SnapshotterConfig) {
+		config.dmverityMode = mode
+	}
+}
+
 // WithDefaultSize creates a default size writable layer for active snapshots
 func WithDefaultSize(size int64) Opt {
 	return func(config *SnapshotterConfig) {
@@ -85,6 +97,13 @@ func WithDefaultSize(size int64) Opt {
 func WithFsMergeThreshold(v uint) Opt {
 	return func(config *SnapshotterConfig) {
 		config.fsMergeThreshold = v
+	}
+}
+
+// WithRemapIDs enables kernel ID-mapped mounts for user namespace support
+func WithRemapIDs() Opt {
+	return func(config *SnapshotterConfig) {
+		config.remapIDs = true
 	}
 }
 
@@ -103,6 +122,8 @@ type snapshotter struct {
 	defaultWritable  int64
 	blockMode        bool
 	fsMergeThreshold uint
+	remapIDs         bool
+	dmverityMode     string
 }
 
 // NewSnapshotter returns a Snapshotter which uses EROFS+OverlayFS. The layers
@@ -113,6 +134,24 @@ func NewSnapshotter(root string, opts ...Opt) (snapshots.Snapshotter, error) {
 	}
 	for _, opt := range opts {
 		opt(&config)
+	}
+
+	if config.dmverityMode == "" {
+		config.dmverityMode = "auto"
+	}
+
+	if config.dmverityMode != "auto" && config.dmverityMode != "on" && config.dmverityMode != "off" {
+		return nil, fmt.Errorf("invalid dmverity_mode %q: must be \"auto\", \"on\", or \"off\"", config.dmverityMode)
+	}
+
+	if config.dmverityMode == "on" {
+		supported, err := dmverity.IsSupported()
+		if err != nil {
+			return nil, fmt.Errorf("failed to check dm-verity support: %w", err)
+		}
+		if !supported {
+			return nil, fmt.Errorf("dmverity_mode is 'on' but dm-verity is not supported on this system")
+		}
 	}
 
 	if err := os.MkdirAll(root, 0700); err != nil {
@@ -160,6 +199,8 @@ func NewSnapshotter(root string, opts ...Opt) (snapshots.Snapshotter, error) {
 		defaultWritable:  config.defaultSize,
 		blockMode:        config.defaultSize > 0,
 		fsMergeThreshold: config.fsMergeThreshold,
+		remapIDs:         config.remapIDs,
+		dmverityMode:     config.dmverityMode,
 	}, nil
 }
 
@@ -241,7 +282,51 @@ func (s *snapshotter) mountFsMeta(snap storage.Snapshot, id int) (mount.Mount, b
 	return m, true
 }
 
-func (s *snapshotter) mounts(snap storage.Snapshot, _ snapshots.Info) ([]mount.Mount, error) {
+// applyDmverityPolicy validates and applies dm-verity policy for a layer.
+// Returns the X-containerd.dmverity option if needed, or empty string otherwise.
+func (s *snapshotter) applyDmverityPolicy(layerBlob string) (string, error) {
+	metadataPath := dmverity.MetadataPath(layerBlob)
+	_, metadataErr := os.Stat(metadataPath)
+	metadataExists := metadataErr == nil
+
+	// Validate dmverityMode policy: mode "on" requires .dmverity metadata to exist
+	if s.dmverityMode == "on" && !metadataExists {
+		return "", fmt.Errorf("dm-verity mode is 'on' but .dmverity metadata not found for layer %s. "+
+			"This may happen if the layer was created before dm-verity was enabled. "+
+			"Consider cleaning up existing snapshots and re-pulling the image, "+
+			"or set dmverity_mode to 'auto' to allow layers without dm-verity metadata", layerBlob)
+	}
+
+	// Only return option if metadata exists and we need to override the default "auto" behavior
+	// This keeps standard EROFS mounts (without dm-verity) unchanged
+	if metadataExists && s.dmverityMode != "auto" {
+		// Mode "off": disables dm-verity even though metadata exists
+		// Mode "on": explicitly enables dm-verity (though "auto" would do the same)
+		return fmt.Sprintf("X-containerd.dmverity=%s", s.dmverityMode), nil
+	}
+
+	return "", nil
+}
+
+// createErofsMount creates a mount specification for an EROFS layer.
+// Applies dmverityMode policy and passes it to the mount handler.
+func (s *snapshotter) createErofsMount(layerBlob string) (mount.Mount, error) {
+	options := []string{"ro", "loop"}
+
+	if dmverityOpt, err := s.applyDmverityPolicy(layerBlob); err != nil {
+		return mount.Mount{}, err
+	} else if dmverityOpt != "" {
+		options = append(options, dmverityOpt)
+	}
+
+	return mount.Mount{
+		Source:  layerBlob,
+		Type:    "erofs",
+		Options: options,
+	}, nil
+}
+
+func (s *snapshotter) mounts(snap storage.Snapshot, info snapshots.Info) ([]mount.Mount, error) {
 	var options []string
 
 	if len(snap.ParentIDs) == 0 {
@@ -254,13 +339,11 @@ func (s *snapshotter) mounts(snap storage.Snapshot, _ snapshots.Info) ([]mount.M
 					return nil, err
 				}
 			}
-			return []mount.Mount{
-				{
-					Source:  layerBlob,
-					Type:    "erofs",
-					Options: []string{"ro", "loop"},
-				},
-			}, nil
+			m, err := s.createErofsMount(layerBlob)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create erofs mount: %w", err)
+			}
+			return []mount.Mount{m}, nil
 		}
 		// if we only have one layer/no parents then just return a bind mount as overlay
 		// will not work
@@ -338,13 +421,11 @@ func (s *snapshotter) mounts(snap storage.Snapshot, _ snapshots.Info) ([]mount.M
 		if err != nil {
 			return nil, err
 		}
-		return []mount.Mount{
-			{
-				Source:  layerBlob,
-				Type:    "erofs",
-				Options: []string{"ro", "loop"},
-			},
-		}, nil
+		m, err := s.createErofsMount(layerBlob)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create erofs mount: %w", err)
+		}
+		return []mount.Mount{m}, nil
 	}
 
 	first := len(mounts)
@@ -364,10 +445,9 @@ func (s *snapshotter) mounts(snap storage.Snapshot, _ snapshots.Info) ([]mount.M
 			return nil, err
 		}
 
-		m := mount.Mount{
-			Source:  layerBlob,
-			Type:    "erofs",
-			Options: []string{"ro", "loop"},
+		m, err := s.createErofsMount(layerBlob)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create erofs mount for parent %s: %w", snap.ParentIDs[i], err)
 		}
 
 		mounts = append(mounts, m)
@@ -377,6 +457,16 @@ func (s *snapshotter) mounts(snap storage.Snapshot, _ snapshots.Info) ([]mount.M
 	} else {
 		options = append(options, fmt.Sprintf("lowerdir={{ overlay %d %d }}", first, len(mounts)-1))
 	}
+
+	if s.remapIDs {
+		if v, ok := info.Labels[snapshots.LabelSnapshotUIDMapping]; ok {
+			options = append(options, fmt.Sprintf("uidmap=%s", v))
+		}
+		if v, ok := info.Labels[snapshots.LabelSnapshotGIDMapping]; ok {
+			options = append(options, fmt.Sprintf("gidmap=%s", v))
+		}
+	}
+
 	options = append(options, s.ovlOptions...)
 
 	return append(mounts, mount.Mount{
@@ -426,9 +516,53 @@ func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 			return fmt.Errorf("failed to get snapshot info: %w", err)
 		}
 
-		if len(snap.ParentIDs) > 0 {
-			if err := upperDirectoryPermission(filepath.Join(td, "fs"), s.upperPath(snap.ParentIDs[0])); err != nil {
-				return err
+		// In non-block mode, set the ownership of the upperdir so that
+		// user-namespace-remapped containers can write to it.
+		// In block mode the upperdir lives inside the block image,
+		// so host ownership is irrelevant.
+		if !s.blockMode {
+			var (
+				mappedUID, mappedGID     = -1, -1
+				uidmapLabel, gidmapLabel string
+				needsRemap               = false
+			)
+			if v, ok := info.Labels[snapshots.LabelSnapshotUIDMapping]; ok {
+				uidmapLabel = v
+				needsRemap = true
+			}
+			if v, ok := info.Labels[snapshots.LabelSnapshotGIDMapping]; ok {
+				gidmapLabel = v
+				needsRemap = true
+			}
+
+			if needsRemap {
+				var idMap userns.IDMap
+				if err = idMap.Unmarshal(uidmapLabel, gidmapLabel); err != nil {
+					return fmt.Errorf("failed to unmarshal snapshot ID mapped labels: %w", err)
+				}
+				root, err := idMap.RootPair()
+				if err != nil {
+					return fmt.Errorf("failed to find root pair: %w", err)
+				}
+				mappedUID, mappedGID = int(root.Uid), int(root.Gid)
+			}
+
+			// Fall back to copying ownership from parent if no ID mapping labels
+			if mappedUID == -1 || mappedGID == -1 {
+				if len(snap.ParentIDs) > 0 {
+					uid, gid, err := getParentOwnership(s.upperPath(snap.ParentIDs[0]))
+					if err != nil {
+						return fmt.Errorf("failed to get parent ownership: %w", err)
+					}
+					mappedUID = uid
+					mappedGID = gid
+				}
+			}
+
+			if mappedUID != -1 && mappedGID != -1 {
+				if err := os.Lchown(filepath.Join(td, "fs"), mappedUID, mappedGID); err != nil {
+					return fmt.Errorf("failed to chown: %w", err)
+				}
 			}
 		}
 
@@ -580,6 +714,8 @@ func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 		}
 	}
 
+	// Note: dm-verity formatting is handled by the EROFS differ, not here
+
 	return s.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
 		if _, err := os.Stat(layerBlob); err != nil {
 			return fmt.Errorf("failed to get the converted erofs blob: %w", err)
@@ -660,6 +796,9 @@ func (s *snapshotter) Remove(ctx context.Context, key string) (err error) {
 				log.G(ctx).WithError(err).WithField("id", id).Warnf("failed to cleanup upperdir")
 			}
 
+			// Note: dm-verity device cleanup is handled by the EROFS mount handler
+			// during Deactivate/Unmount, not here in Remove()
+
 			for _, dir := range removals {
 				if err := os.RemoveAll(dir); err != nil {
 					log.G(ctx).WithError(err).WithField("path", dir).Warn("failed to remove directory")
@@ -668,9 +807,23 @@ func (s *snapshotter) Remove(ctx context.Context, key string) (err error) {
 		}
 	}()
 	return s.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
-		var k snapshots.Kind
+		id, info, _, err := storage.GetInfo(ctx, key)
+		if err != nil {
+			if errdefs.IsNotFound(err) {
+				return nil
+			}
+			return fmt.Errorf("failed to get snapshot info: %w", err)
+		}
 
-		id, k, err = storage.Remove(ctx, key)
+		// The layer blob is only persisted for committed snapshots.
+		if info.Kind == snapshots.KindCommitted {
+			// Clear IMMUTABLE_FL before removal, since this flag avoids it.
+			err = setImmutable(s.layerBlobPath(id), false)
+			if err != nil && !errdefs.IsNotImplemented(err) {
+				return fmt.Errorf("failed to clear IMMUTABLE_FL: %w", err)
+			}
+		}
+		_, _, err = storage.Remove(ctx, key)
 		if err != nil {
 			return fmt.Errorf("failed to remove snapshot %s: %w", key, err)
 		}
@@ -678,14 +831,6 @@ func (s *snapshotter) Remove(ctx context.Context, key string) (err error) {
 		removals, err = s.getCleanupDirectories(ctx)
 		if err != nil {
 			return fmt.Errorf("unable to get directories for removal: %w", err)
-		}
-		// The layer blob is only persisted for committed snapshots.
-		if k == snapshots.KindCommitted {
-			// Clear IMMUTABLE_FL before removal, since this flag avoids it.
-			err = setImmutable(s.layerBlobPath(id), false)
-			if err != nil && !errdefs.IsNotImplemented(err) {
-				return fmt.Errorf("failed to clear IMMUTABLE_FL: %w", err)
-			}
 		}
 		return nil
 	})

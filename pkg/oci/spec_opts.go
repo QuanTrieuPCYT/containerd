@@ -25,10 +25,12 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"math"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -130,10 +132,8 @@ func setCapabilities(s *Spec) {
 // ensureAdditionalGids ensures that the primary GID is also included in the additional GID list.
 func ensureAdditionalGids(s *Spec) {
 	setProcess(s)
-	for _, f := range s.Process.User.AdditionalGids {
-		if f == s.Process.User.GID {
-			return
-		}
+	if slices.Contains(s.Process.User.AdditionalGids, s.Process.User.GID) {
+		return
 	}
 	s.Process.User.AdditionalGids = append([]uint32{s.Process.User.GID}, s.Process.User.AdditionalGids...)
 }
@@ -881,12 +881,7 @@ func WithAdditionalGIDs(userstr string) SpecOpts {
 				if g.Name == username {
 					return false
 				}
-				for _, entry := range g.List {
-					if entry == username {
-						return true
-					}
-				}
-				return false
+				return slices.Contains(g.List, username)
 			})
 			if err != nil {
 				if os.IsNotExist(err) {
@@ -973,7 +968,7 @@ func WithAppendAdditionalGroups(groups ...string) SpecOpts {
 			defer ensureAdditionalGids(s)
 
 			var ugroups []user.Group
-			f, groupErr := root.Open("etc/group")
+			f, groupErr := openUserFile(root, "etc/group")
 			if groupErr == nil {
 				defer f.Close()
 				ugroups, groupErr = user.ParseGroup(f)
@@ -1057,12 +1052,7 @@ func WithCapabilities(caps []string) SpecOpts {
 }
 
 func capsContain(caps []string, s string) bool {
-	for _, c := range caps {
-		if c == s {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(caps, s)
 }
 
 func removeCap(caps *[]string, s string) {
@@ -1152,7 +1142,7 @@ func UserFromPath(root string, filter func(user.User) bool) (user.User, error) {
 // UserFromFS inspects the user object using /etc/passwd in the specified fs.FS.
 // filter can be nil.
 func UserFromFS(root fs.FS, filter func(user.User) bool) (user.User, error) {
-	f, err := root.Open("etc/passwd")
+	f, err := openUserFile(root, "etc/passwd")
 	if err != nil {
 		return user.User{}, err
 	}
@@ -1184,7 +1174,7 @@ func GIDFromPath(root string, filter func(user.Group) bool) (gid uint32, err err
 // GIDFromFS inspects the GID using /etc/group in the specified fs.FS.
 // filter can be nil.
 func GIDFromFS(root fs.FS, filter func(user.Group) bool) (gid uint32, err error) {
-	f, err := root.Open("etc/group")
+	f, err := openUserFile(root, "etc/group")
 	if err != nil {
 		return 0, err
 	}
@@ -1201,7 +1191,7 @@ func GIDFromFS(root fs.FS, filter func(user.Group) bool) (gid uint32, err error)
 }
 
 func getSupplementalGroupsFromFS(root fs.FS, filter func(user.Group) bool) ([]uint32, error) {
-	f, err := root.Open("etc/group")
+	f, err := openUserFile(root, "etc/group")
 	if err != nil {
 		return []uint32{}, err
 	}
@@ -1469,9 +1459,7 @@ func WithAnnotations(annotations map[string]string) SpecOpts {
 		if s.Annotations == nil {
 			s.Annotations = make(map[string]string)
 		}
-		for k, v := range annotations {
-			s.Annotations[k] = v
-		}
+		maps.Copy(s.Annotations, annotations)
 		return nil
 	}
 }
@@ -1815,4 +1803,44 @@ func WithWindowsNetworkNamespace(ns string) SpecOpts {
 		s.Windows.Network.NetworkNamespace = ns
 		return nil
 	}
+}
+
+// readLinker defines the ReadLink method locally.
+// We keep this shim to ensure compatibility with build environments where
+// the standard library's fs.ReadLinkFS interface is not yet available or recognized.
+type readLinker interface {
+	ReadLink(name string) (string, error)
+}
+
+// openUserFile attempts to open a file within the root fs.
+// It handles cases where the file is an absolute symlink (e.g., NixOS /etc/passwd -> /nix/store/...),
+// which triggers "path escapes from parent" errors in Go 1.24+ due to stricter os.DirFS validation.
+func openUserFile(root fs.FS, name string) (fs.File, error) {
+	f, err := root.Open(name)
+	if err == nil {
+		return f, nil
+	}
+
+	// Check if the FS implements our local ReadLink interface.
+	// We use a local interface instead of fs.ReadLinkFS to avoid strict dependency
+	// issues in some build environments.
+	if lfs, ok := root.(readLinker); ok {
+		if target, lerr := lfs.ReadLink(name); lerr == nil {
+			// Use filepath.IsAbs to handle platform-agnostic absolute path checks
+			if filepath.IsAbs(target) {
+				// Re-anchor the absolute path to the root.
+				// e.g. /nix/store/... becomes nix/store/... (relative to root fs)
+				// We use filepath.Rel to safely strip the leading separator.
+				rel, rerr := filepath.Rel(string(filepath.Separator), target)
+				if rerr == nil {
+					// filepath.Rel might return OS-specific separators (backslashes on Windows).
+					// fs.Open strictly expects forward slashes, so we convert it.
+					return root.Open(filepath.ToSlash(rel))
+				}
+			}
+		}
+	}
+
+	// Return the original error if we couldn't resolve it
+	return nil, err
 }

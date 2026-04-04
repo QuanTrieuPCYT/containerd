@@ -139,7 +139,12 @@ const (
 
 func parseFlags() {
 	flag.BoolVar(&debugFlag, "debug", false, "enable debug output in logs")
-	flag.BoolVar(&versionFlag, "v", false, "show the shim version and exit")
+
+	// short + long form. omitting the usage (description) of the short-form
+	// to group it with the long form.
+	flag.BoolVar(&versionFlag, "v", false, "")
+	flag.BoolVar(&versionFlag, "version", false, "show the shim version and exit")
+
 	// "info" is not a subcommand, because old shims produce very confusing errors for unknown subcommands
 	// https://github.com/containerd/containerd/pull/8509#discussion_r1210021403
 	flag.BoolVar(&infoFlag, "info", false, "get the option protobuf from stdin, print the shim info protobuf to stdout, and exit")
@@ -314,7 +319,7 @@ func run(ctx context.Context, manager Manager, config Config) error {
 	registry.Register(&plugin.Registration{
 		Type: plugins.InternalPlugin,
 		ID:   "shutdown",
-		InitFn: func(ic *plugin.InitContext) (interface{}, error) {
+		InitFn: func(ic *plugin.InitContext) (any, error) {
 			return sd, nil
 		},
 	})
@@ -323,7 +328,7 @@ func run(ctx context.Context, manager Manager, config Config) error {
 	registry.Register(&plugin.Registration{
 		Type: plugins.EventPlugin,
 		ID:   "publisher",
-		InitFn: func(ic *plugin.InitContext) (interface{}, error) {
+		InitFn: func(ic *plugin.InitContext) (any, error) {
 			return NewPublisher(ttrpcAddress, func(cfg *publisherConfig) {
 				p, _ := ic.GetByID(plugins.TTRPCPlugin, "otelttrpc")
 				if p == nil {

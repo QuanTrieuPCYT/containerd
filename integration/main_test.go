@@ -24,6 +24,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -71,6 +72,7 @@ var (
 var criEndpoint = flag.String("cri-endpoint", "unix:///run/containerd/containerd.sock", "The endpoint of cri plugin.")
 var runtimeHandler = flag.String("runtime-handler", "", "The runtime handler to use in the test.")
 var containerdBin = flag.String("containerd-bin", "containerd", "The containerd binary name. The name is used to restart containerd during test.")
+var buildDir = flag.String("build-dir", "", "Build output directory for containerd binaries")
 
 func TestMain(m *testing.M) {
 	flag.Parse()
@@ -227,9 +229,7 @@ func WithPodHostname(hostname string) PodSandboxOpts {
 // Add pod labels.
 func WithPodLabels(kvs map[string]string) PodSandboxOpts {
 	return func(p *runtime.PodSandboxConfig) {
-		for k, v := range kvs {
-			p.Labels[k] = v
-		}
+		maps.Copy(p.Labels, kvs)
 	}
 }
 

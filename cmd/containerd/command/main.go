@@ -20,11 +20,13 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"iter"
 	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"time"
 
 	"github.com/containerd/containerd/v2/cmd/containerd/server"
@@ -33,9 +35,13 @@ import (
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/defaults"
 	"github.com/containerd/containerd/v2/pkg/sys"
+	"github.com/containerd/containerd/v2/pkg/tracing"
 	"github.com/containerd/containerd/v2/version"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
+	"github.com/containerd/plugin"
+	"github.com/containerd/plugin/registry"
+	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli/v2"
 	"google.golang.org/grpc/grpclog"
 )
@@ -57,15 +63,22 @@ func init() {
 	cli.VersionPrinter = func(cliContext *cli.Context) {
 		fmt.Println(cliContext.App.Name, version.Package, cliContext.App.Version, version.Revision)
 	}
+
+	// Override the default flag descriptions for '--version' and '--help'
+	// to align with other flags and start with uppercase.
 	cli.VersionFlag = &cli.BoolFlag{
 		Name:    "version",
 		Aliases: []string{"v"},
 		Usage:   "Print the version",
+
+		DisableDefaultText: true,
 	}
 	cli.HelpFlag = &cli.BoolFlag{
 		Name:    "help",
 		Aliases: []string{"h"},
 		Usage:   "Show help",
+
+		DisableDefaultText: true,
 	}
 }
 
@@ -119,6 +132,10 @@ can be used and modified as necessary as a custom configuration.`
 		ociHook,
 	}
 	app.Action = func(cliContext *cli.Context) error {
+		if args := cliContext.Args(); args.First() != "" {
+			return cli.ShowCommandHelp(cliContext, args.First())
+		}
+
 		var (
 			start       = time.Now()
 			signals     = make(chan os.Signal, 2048)
@@ -134,7 +151,11 @@ can be used and modified as necessary as a custom configuration.`
 		configPath := cliContext.String("config")
 		_, err := os.Stat(configPath)
 		if !os.IsNotExist(err) || cliContext.IsSet("config") {
-			if err := srvconfig.LoadConfig(ctx, configPath, config); err != nil {
+			g := registry.Graph(func(*plugin.Registration) bool { return false })
+			plugins := func() iter.Seq[plugin.Registration] {
+				return slices.Values(g)
+			}
+			if err := srvconfig.LoadConfigWithPlugins(ctx, configPath, plugins, config); err != nil {
 				return err
 			}
 		}
@@ -185,6 +206,10 @@ can be used and modified as necessary as a custom configuration.`
 		for _, w := range warnings {
 			log.G(ctx).WithError(w).Warn("cleanup temp mount")
 		}
+
+		// Register logging hook for tracing
+		tracingHook := tracing.NewLogrusHook(tracing.WithTraceIDField(config.Debug.LogTraceID))
+		logrus.StandardLogger().AddHook(tracingHook)
 
 		log.G(ctx).WithFields(log.Fields{
 			"version":  version.Version,

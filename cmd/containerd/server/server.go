@@ -66,7 +66,6 @@ import (
 	"github.com/containerd/containerd/v2/pkg/timeout"
 	"github.com/containerd/containerd/v2/plugins"
 	"github.com/containerd/containerd/v2/plugins/services/warning"
-	"github.com/containerd/containerd/v2/version"
 )
 
 // CreateTopLevelDirectories creates the top-level root and state directories.
@@ -84,10 +83,11 @@ func CreateTopLevelDirectories(config *srvconfig.Config) error {
 		return err
 	}
 	// chmod is needed for upgrading from an older release that created the dir with 0o711
-	if err := os.Chmod(config.Root, 0o700); err != nil {
+	// We ignore file permission issues due to non-standard rootless deployments that do not put the daemon in UserNS: https://github.com/containerd/containerd/issues/12520
+	// These deployments fundamentally cannot perform this migration without sudo intervention.
+	if err := os.Chmod(config.Root, 0o700); err != nil && !errors.Is(err, os.ErrPermission) {
 		return err
 	}
-
 	// For supporting userns-remapped containers, the state dir cannot be just mkdired with 0o700.
 	// Each of plugins creates a dedicated directory beneath the state dir with appropriate permission bits.
 	if err := sys.MkdirAllWithACL(config.State, 0o711); err != nil {
@@ -108,7 +108,9 @@ func CreateTopLevelDirectories(config *srvconfig.Config) error {
 			return err
 		}
 		// chmod is needed for upgrading from an older release that created the dir with 0o711
-		if err := os.Chmod(config.Root, 0o700); err != nil {
+		// We ignore file permission issues due to non-standard rootless deployments that do not put the daemon in UserNS: https://github.com/containerd/containerd/issues/12520
+		// These deployments fundamentally cannot perform this migration without sudo intervention.
+		if err := os.Chmod(config.TempDir, 0o700); err != nil && !errors.Is(err, os.ErrPermission) {
 			return err
 		}
 		if runtime.GOOS == "windows" {
@@ -129,20 +131,6 @@ func CreateTopLevelDirectories(config *srvconfig.Config) error {
 
 // New creates and initializes a new containerd server
 func New(ctx context.Context, config *srvconfig.Config) (*Server, error) {
-	var (
-		currentVersion = config.Version
-		migrationT     time.Duration
-	)
-	if currentVersion < version.ConfigVersion {
-		// Migrate config to latest version
-		t1 := time.Now()
-		err := config.MigrateConfig(ctx)
-		if err != nil {
-			return nil, err
-		}
-		migrationT = time.Since(t1)
-	}
-
 	if err := apply(ctx, config); err != nil {
 		return nil, err
 	}
@@ -261,26 +249,6 @@ func New(ctx context.Context, config *srvconfig.Config) (*Server, error) {
 	)
 	for _, r := range config.RequiredPlugins {
 		required[r] = struct{}{}
-	}
-
-	if currentVersion < version.ConfigVersion {
-		t1 := time.Now()
-		// Run migration for each configuration version
-		// Run each plugin migration for each version to ensure that migration logic is simple and
-		// focused on upgrading from one version at a time.
-		for v := currentVersion; v < version.ConfigVersion; v++ {
-			for _, p := range loaded {
-				if p.ConfigMigration != nil {
-					if err := p.ConfigMigration(ctx, v, config.Plugins); err != nil {
-						return nil, err
-					}
-				}
-			}
-		}
-		migrationT = migrationT + time.Since(t1)
-	}
-	if migrationT > 0 {
-		log.G(ctx).WithField("t", migrationT).Warnf("Configuration migrated from version %d, use `containerd config migrate` to avoid migration", currentVersion)
 	}
 
 	for _, p := range loaded {
@@ -497,7 +465,7 @@ func LoadPlugins(ctx context.Context, config *srvconfig.Config) ([]plugin.Regist
 	for name, pp := range config.ProxyPlugins {
 		var (
 			t plugin.Type
-			f func(*grpc.ClientConn) interface{}
+			f func(*grpc.ClientConn) any
 
 			address = pp.Address
 			p       v1.Platform
@@ -508,23 +476,23 @@ func LoadPlugins(ctx context.Context, config *srvconfig.Config) ([]plugin.Regist
 		case string(plugins.SnapshotPlugin), "snapshot":
 			t = plugins.SnapshotPlugin
 			ssname := name
-			f = func(conn *grpc.ClientConn) interface{} {
+			f = func(conn *grpc.ClientConn) any {
 				return ssproxy.NewSnapshotter(ssapi.NewSnapshotsClient(conn), ssname)
 			}
 
 		case string(plugins.ContentPlugin), "content":
 			t = plugins.ContentPlugin
-			f = func(conn *grpc.ClientConn) interface{} {
+			f = func(conn *grpc.ClientConn) any {
 				return csproxy.NewContentStore(conn)
 			}
 		case string(plugins.SandboxControllerPlugin), "sandbox":
 			t = plugins.SandboxControllerPlugin
-			f = func(conn *grpc.ClientConn) interface{} {
+			f = func(conn *grpc.ClientConn) any {
 				return sbproxy.NewSandboxController(sbapi.NewControllerClient(conn), name)
 			}
 		case string(plugins.DiffPlugin), "diff":
 			t = plugins.DiffPlugin
-			f = func(conn *grpc.ClientConn) interface{} {
+			f = func(conn *grpc.ClientConn) any {
 				return diffproxy.NewDiffApplier(diffapi.NewDiffClient(conn))
 			}
 		default:
@@ -548,7 +516,7 @@ func LoadPlugins(ctx context.Context, config *srvconfig.Config) ([]plugin.Regist
 		registry.Register(&plugin.Registration{
 			Type: t,
 			ID:   name,
-			InitFn: func(ic *plugin.InitContext) (interface{}, error) {
+			InitFn: func(ic *plugin.InitContext) (any, error) {
 				ic.Meta.Exports = exports
 				ic.Meta.Platforms = append(ic.Meta.Platforms, p)
 				ic.Meta.Capabilities = pp.Capabilities
@@ -587,6 +555,7 @@ func (pc *proxyClients) getClient(address string) (*grpc.ClientConn, error) {
 		Backoff: backoffConfig,
 	}
 	gopts := []grpc.DialOption{
+		grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithConnectParams(connParams),
 		grpc.WithContextDialer(dialer.ContextDialer),

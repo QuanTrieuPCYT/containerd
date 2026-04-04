@@ -53,6 +53,8 @@ type erofsDiff struct {
 	// enableTarIndex enables generating tar index for tar content
 	// instead of fully converting the tar to EROFS format
 	enableTarIndex bool
+	// enableDmverity enables formatting layers with dm-verity after creation
+	enableDmverity bool
 }
 
 // DifferOpt is an option for configuring the erofs differ
@@ -69,6 +71,13 @@ func WithMkfsOptions(opts []string) DifferOpt {
 func WithTarIndexMode() DifferOpt {
 	return func(d *erofsDiff) {
 		d.enableTarIndex = true
+	}
+}
+
+// WithDmverity enables dm-verity formatting for EROFS layers
+func WithDmverity() DifferOpt {
+	return func(d *erofsDiff) {
+		d.enableDmverity = true
 	}
 }
 
@@ -89,8 +98,6 @@ func NewErofsDiffer(store content.Store, opts ...DifferOpt) differ {
 	return d
 }
 
-// A valid EROFS native layer media type should end with ".erofs".
-//
 // Please avoid using any +suffix to list the algorithms used inside EROFS
 // blobs, since:
 //   - Each EROFS layer can use multiple compression algorithms;
@@ -100,11 +107,11 @@ func NewErofsDiffer(store content.Store, opts ...DifferOpt) differ {
 // Since `images.DiffCompression` doesn't support arbitrary media types,
 // disallow non-empty suffixes for now.
 func isErofsMediaType(mt string) bool {
-	mediaType, _, hasExt := strings.Cut(mt, "+")
-	if hasExt {
+	if !strings.HasSuffix(mt, ".erofs") && !strings.HasPrefix(mt, "application/vnd.erofs.layer") {
 		return false
 	}
-	return strings.HasSuffix(mediaType, ".erofs")
+	_, _, hasExt := strings.Cut(mt, "+")
+	return !hasExt
 }
 
 func (s erofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts []mount.Mount, opts ...diff.ApplyOpt) (d ocispec.Descriptor, err error) {
@@ -176,16 +183,17 @@ func (s erofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts []
 	}
 
 	// Choose between tar index or tar conversion mode
+	// Generate deterministic UUID from layer digest
+	u := uuid.NewSHA1(uuid.NameSpaceURL, []byte("erofs:blobs/"+desc.Digest))
 	if s.enableTarIndex {
 		// Use the tar index method: generate tar index and append tar
-		err = erofsutils.GenerateTarIndexAndAppendTar(ctx, rc, layerBlobPath, s.mkfsExtraOpts)
+		err = erofsutils.GenerateTarIndexAndAppendTar(ctx, rc, layerBlobPath, u.String(), s.mkfsExtraOpts)
 		if err != nil {
 			return emptyDesc, fmt.Errorf("failed to generate tar index: %w", err)
 		}
 		log.G(ctx).WithField("path", layerBlobPath).Debug("Applied layer using tar index mode")
 	} else {
 		// Use the tar method: fully convert tar to EROFS
-		u := uuid.NewSHA1(uuid.NameSpaceURL, []byte("erofs:blobs/"+desc.Digest))
 		err = erofsutils.ConvertTarErofs(ctx, rc, layerBlobPath, u.String(), s.mkfsExtraOpts)
 		if err != nil {
 			return emptyDesc, fmt.Errorf("failed to convert tar to erofs: %w", err)
@@ -196,6 +204,13 @@ func (s erofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts []
 	// Read any trailing data
 	if _, err := io.Copy(io.Discard, rc); err != nil {
 		return emptyDesc, err
+	}
+
+	// Format with dm-verity if enabled
+	if s.enableDmverity {
+		if err := s.formatDmverityLayer(ctx, layerBlobPath); err != nil {
+			return emptyDesc, fmt.Errorf("failed to format dm-verity layer: %w", err)
+		}
 	}
 
 	return ocispec.Descriptor{

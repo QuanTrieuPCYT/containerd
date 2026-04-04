@@ -93,11 +93,9 @@ func NewStatsCollector(config criconfig.Config) *StatsCollector {
 		}
 	}
 
-	// Calculate maxSamples from statsAge and interval
-	maxSamples := int(statsAge / interval)
-	if maxSamples < 2 {
-		maxSamples = 2 // Need at least 2 samples to calculate rate
-	}
+	// Calculate maxSamples from statsAge and interval.
+	// We need at least 2 samples to calculate rate.
+	maxSamples := max(int(statsAge/interval), 2)
 
 	return &StatsCollector{
 		stores:     make(map[string]*stats.TimedStore),
@@ -231,7 +229,7 @@ func (c *StatsCollector) getCgroupCPUUsage(ctx context.Context, cgroupPath strin
 			log.G(ctx).WithError(err).Debugf("StatsCollector: failed to load cgroupv2: %s", cgroupPath)
 			return 0, false
 		}
-		stats, err := cg.Stat()
+		stats, err := cg.StatFiltered(cgroupsv2.StatCPU)
 		if err != nil {
 			log.G(ctx).WithError(err).Debugf("StatsCollector: failed to get cgroupv2 stats: %s", cgroupPath)
 			return 0, false
@@ -273,7 +271,7 @@ func (c *StatsCollector) addSample(id string, timestamp time.Time, usageCoreNano
 	store.Add(timestamp, usageCoreNanoSeconds)
 }
 
-// GetUsageNanoCores returns the latest calculated UsageNanoCores for the given
+// GetUsageNanoCores returns the latest instantaneous UsageNanoCores rate for the given
 // container/sandbox ID. Returns 0 and false if no data is available or if
 // there aren't enough samples to calculate the rate.
 func (c *StatsCollector) GetUsageNanoCores(id string) (uint64, bool) {

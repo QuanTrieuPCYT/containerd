@@ -60,6 +60,12 @@ func (p dockerPusher) Writer(ctx context.Context, opts ...content.WriterOpt) (co
 	if wOpts.Ref == "" {
 		return nil, fmt.Errorf("ref must not be empty: %w", errdefs.ErrInvalidArgument)
 	}
+	if wOpts.Desc.Digest == "" {
+		return nil, fmt.Errorf("descriptor digest must not be empty: %w", errdefs.ErrInvalidArgument)
+	}
+	if wOpts.Desc.MediaType == "" {
+		return nil, fmt.Errorf("descriptor media type must not be empty: %w", errdefs.ErrInvalidArgument)
+	}
 	return p.push(ctx, wOpts.Desc, wOpts.Ref, true)
 }
 
@@ -113,7 +119,7 @@ func (p dockerPusher) push(ctx context.Context, desc ocispec.Descriptor, ref str
 	req := p.request(host, http.MethodHead, existCheck...)
 	req.header.Set("Accept", strings.Join([]string{desc.MediaType, `*/*`}, ", "))
 
-	log.G(ctx).WithField("url", req.String()).Debugf("checking and pushing to")
+	log.G(ctx).WithField("url", req.sanitizedURL()).Debugf("checking and pushing to")
 
 	resp, err := req.doWithRetries(ctx, true)
 	if err != nil {

@@ -17,6 +17,7 @@
 package transfer
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/containerd/errdefs"
@@ -54,7 +55,7 @@ func init() {
 			plugins.SnapshotPlugin,
 		},
 		Config: defaultConfig(),
-		InitFn: func(ic *plugin.InitContext) (interface{}, error) {
+		InitFn: func(ic *plugin.InitContext) (any, error) {
 			config := ic.Config.(*transferConfig)
 			m, err := ic.GetSingle(plugins.MetadataPlugin)
 			if err != nil {
@@ -71,7 +72,7 @@ func init() {
 			lc.Leases = l.(leases.Manager)
 
 			vps, err := ic.GetByType(plugins.ImageVerifierPlugin)
-			if err != nil {
+			if err != nil && !errors.Is(err, plugin.ErrPluginNotFound) {
 				return nil, err
 			}
 			if len(vps) > 0 {
@@ -101,6 +102,9 @@ func init() {
 
 				sn := ms.Snapshotter(uc.Snapshotter)
 				if sn == nil {
+					if uc.Optional {
+						continue
+					}
 					return nil, fmt.Errorf("snapshotter %q not found: %w", uc.Snapshotter, errdefs.ErrNotFound)
 				}
 				var (
@@ -122,13 +126,19 @@ func init() {
 					applier = inst.(diff.Applier)
 				} else {
 					var applierID string
-					for name, plugin := range ic.GetAll() {
+					for _, plugin := range ic.GetAll() {
 						if plugin.Registration.Type != plugins.DiffPlugin {
 							continue
 						}
 						var matched bool
-						for _, p := range plugin.Meta.Platforms {
-							if target.Match(p) {
+						for _, pd := range plugin.Meta.Platforms {
+							// Note that we must use the platforms supported by the differ to
+							// match the platform in `UnpackConfiguration`.
+							//
+							// For example, a differ might only support "linux/amd64", while
+							// the platform in `UnpackConfiguration` is "linux(+erofs)/amd64".
+							// If we reverse this logic, this wrong differ will be applied.
+							if platforms.Only(pd).Match(p) {
 								matched = true
 							}
 						}
@@ -151,19 +161,22 @@ func init() {
 						}
 						inst, err := plugin.Instance()
 						if err != nil {
-							return nil, fmt.Errorf("failed to get instance for diff plugin %q: %w", name, err)
+							return nil, fmt.Errorf("failed to get instance for diff plugin %q: %w", plugin.Registration.ID, err)
 						}
 						applier = inst.(diff.Applier)
 						applierID = plugin.Registration.ID
 					}
 				}
 				if applier == nil {
+					if uc.Optional {
+						continue
+					}
 					return nil, fmt.Errorf("no matching diff plugins: %w", errdefs.ErrNotFound)
 				}
 
-				// If CheckPlatformSupported is false, we will match all platforms
+				// If CheckPlatformSupported is false, platforms.OnlyOS() is applied
 				if !config.CheckPlatformSupported {
-					target = platforms.All
+					target = platforms.OnlyOS(p)
 				}
 
 				up := unpack.Platform{
@@ -228,6 +241,9 @@ type unpackConfiguration struct {
 
 	// LayerTypes are the allowed layer types for this unpack configuration
 	LayerTypes []string `toml:"layer_types"`
+
+	// Optional skips the configuration when initialization fails
+	Optional bool `toml:"optional"`
 }
 
 func defaultConfig() *transferConfig {

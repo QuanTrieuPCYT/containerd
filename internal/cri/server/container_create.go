@@ -357,7 +357,7 @@ func (c *criService) createContainer(r *createContainerRequest) (_ string, retEr
 		// the runtime (runc) a chance to modify (e.g. to create mount
 		// points corresponding to spec.Mounts) before making the
 		// rootfs readonly (requested by spec.Root.Readonly).
-		customopts.WithNewSnapshot(r.containerID, *r.containerdImage, sOpts...),
+		customopts.WithNewSnapshot(r.containerID, *r.containerdImage, !c.ImageService.Config().DisableSnapshotAnnotations, sOpts...),
 	}
 	if len(volumeMounts) > 0 {
 		mountMap := make(map[string]string)
@@ -792,6 +792,14 @@ func (c *criService) buildLinuxSpec(
 		}
 	}()
 
+	// cgroupns is used for hiding /sys/fs/cgroup from containers.
+	// For compatibility, cgroupns is not used when running in cgroup v1 mode or in privileged.
+	// https://github.com/containers/libpod/issues/4363
+	// https://github.com/kubernetes/enhancements/blob/0e409b47497e398b369c281074485c8de129694f/keps/sig-node/20191118-cgroups-v2.md#cgroup-namespace
+	if isUnifiedCgroupsMode() && !securityContext.GetPrivileged() {
+		specOpts = append(specOpts, oci.WithLinuxNamespace(runtimespec.LinuxNamespace{Type: runtimespec.CgroupNamespace}))
+	}
+
 	var ociSpecOpts oci.SpecOpts
 	if ociRuntime.CgroupWritable {
 		ociSpecOpts = customopts.WithMountsCgroupWritable(c.os, config, extraMounts, mountLabel, runtimeHandler)
@@ -920,6 +928,28 @@ func (c *criService) buildLinuxSpec(
 		return nil, fmt.Errorf("user namespace config for sandbox is different from container. Sandbox userns config: %v - Container userns config: %v", sandboxUsernsOpts, nsOpts.GetUsernsOptions())
 	}
 
+	// Determine if user namespace is enabled
+	var usernsEnabled bool
+	if nsOpts.GetUsernsOptions() != nil && nsOpts.GetUsernsOptions().GetMode() == runtime.NamespaceMode_POD {
+		usernsEnabled = true
+	}
+
+	// When using both host network and user namespace, we need to bind mount /sys
+	// instead of mounting sysfs, because mounting sysfs will fail with EPERM in this configuration.
+	sandboxNsOpts := sandboxConfig.GetLinux().GetSecurityContext().GetNamespaceOptions()
+	if sandboxNsOpts.GetNetwork() == runtime.NamespaceMode_NODE && usernsEnabled {
+		specOpts = append(specOpts, oci.WithoutMounts("/sys"))
+		// Add bind mount for /sys
+		specOpts = append(specOpts, oci.WithMounts([]runtimespec.Mount{
+			{
+				Source:      "/sys",
+				Destination: "/sys",
+				Type:        "bind",
+				Options:     []string{"rbind", "rro", "nosuid", "nodev", "noexec"},
+			},
+		}))
+	}
+
 	specOpts = append(specOpts,
 		customopts.WithOOMScoreAdj(config, c.config.RestrictOOMScoreAdj),
 		customopts.WithPodNamespaces(securityContext, sandboxPid, targetPid, uids, gids),
@@ -929,14 +959,6 @@ func (c *criService) buildLinuxSpec(
 		specOpts,
 		annotations.DefaultCRIAnnotations(sandboxID, containerName, imageName, sandboxConfig, false)...,
 	)
-
-	// cgroupns is used for hiding /sys/fs/cgroup from containers.
-	// For compatibility, cgroupns is not used when running in cgroup v1 mode or in privileged.
-	// https://github.com/containers/libpod/issues/4363
-	// https://github.com/kubernetes/enhancements/blob/0e409b47497e398b369c281074485c8de129694f/keps/sig-node/20191118-cgroups-v2.md#cgroup-namespace
-	if isUnifiedCgroupsMode() && !securityContext.GetPrivileged() {
-		specOpts = append(specOpts, oci.WithLinuxNamespace(runtimespec.LinuxNamespace{Type: runtimespec.CgroupNamespace}))
-	}
 
 	return specOpts, nil
 }
