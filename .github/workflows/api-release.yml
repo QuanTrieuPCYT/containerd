@@ -6,7 +6,7 @@ on:
 name: API Release
 
 env:
-  GO_VERSION: "1.26.0"
+  GO_VERSION: "1.26.5"
 
 permissions: # added using https://github.com/step-security/secure-workflows
   contents: read
@@ -22,16 +22,17 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.ref }}
           path: src/github.com/containerd/containerd
+          persist-credentials: false
 
       - name: Check signature
         run: |
-          releasever=${{ github.ref }}
+          releasever=${GITHUB_REF}
           releasever="${releasever#refs/tags/}"
-          TAGCHECK=$(git tag -v ${releasever} 2>&1 >/dev/null) ||
+          TAGCHECK=$(git tag -v "${releasever}" 2>&1 >/dev/null) ||
           echo "${TAGCHECK}" | grep -q "error" && {
               echo "::error::tag ${releasever} is not a signed tag. Failing release process."
               exit 1
@@ -44,13 +45,13 @@ jobs:
       - name: Release content
         id: contentrel
         run: |
-          RELEASEVER=${{ github.ref }}
+          RELEASEVER=${GITHUB_REF}
           echo "stringver=${RELEASEVER#refs/tags/api/v}" >> $GITHUB_OUTPUT
-          git tag -l ${RELEASEVER#refs/tags/} -n20000 | tail -n +3 | cut -c 5- >release-notes.md
+          git tag -l "${RELEASEVER#refs/tags/}" -n20000 | tail -n +3 | cut -c 5- >release-notes.md
         working-directory: src/github.com/containerd/containerd
 
       - name: Save release notes
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: containerd-release-notes
           path: src/github.com/containerd/containerd/release-notes.md
@@ -69,7 +70,7 @@ jobs:
         with:
           path: builds
       - name: Create Release
-        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           fail_on_unmatched_files: true

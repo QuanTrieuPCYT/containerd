@@ -113,6 +113,78 @@ func TestErofsWithQuota(t *testing.T) {
 	testsuite.SnapshotterSuite(t, "erofs", newSnapshotter(t, WithDefaultSize(16*1024*1024)))
 }
 
+func TestGetCleanupDirectoriesSkipsSnapshotTempDirs(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	snapshotDir := filepath.Join(root, "snapshots")
+	require.NoError(t, os.Mkdir(snapshotDir, 0700))
+
+	ms, err := storage.NewMetaStore(filepath.Join(root, "metadata.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, ms.Close()) })
+	s := &snapshotter{root: root, ms: ms}
+
+	_, err = os.MkdirTemp(snapshotDir, snapshotTempDirPrefix)
+	require.NoError(t, err)
+	orphanDir := filepath.Join(snapshotDir, "orphan")
+	require.NoError(t, os.Mkdir(orphanDir, 0700))
+	require.NoError(t, ms.WithTransaction(ctx, true, func(ctx context.Context) error {
+		_, err := storage.CreateSnapshot(ctx, snapshots.KindActive, "existing", "")
+		return err
+	}))
+
+	var cleanup []string
+	require.NoError(t, ms.WithTransaction(ctx, true, func(ctx context.Context) error {
+		cleanup, err = s.getCleanupDirectories(ctx)
+		return err
+	}))
+	assert.Equal(t, []string{orphanDir}, cleanup)
+}
+
+// TestWritableSize exercises the LabelSnapshotMaxSize override that the
+// block-mode mkfs path passes to X-containerd.mkfs.size. Covers the
+// happy path (label overrides default), fallback cases (missing, empty,
+// malformed, non-positive), and that a valid label wins over a non-zero
+// configured default.
+func TestWritableSize(t *testing.T) {
+	const defaultSize = int64(16 * 1024 * 1024)
+	s := &snapshotter{defaultWritable: defaultSize}
+
+	for _, tc := range []struct {
+		name   string
+		labels map[string]string
+		want   int64
+	}{
+		{"unset", nil, defaultSize},
+		{"empty-map", map[string]string{}, defaultSize},
+		{"valid-overrides-default", map[string]string{snapshots.LabelSnapshotMaxSize: "268435456"}, 268435456},
+		{"empty-value-falls-back", map[string]string{snapshots.LabelSnapshotMaxSize: ""}, defaultSize},
+		{"non-numeric-falls-back", map[string]string{snapshots.LabelSnapshotMaxSize: "100MB"}, defaultSize},
+		{"zero-falls-back", map[string]string{snapshots.LabelSnapshotMaxSize: "0"}, defaultSize},
+		{"negative-falls-back", map[string]string{snapshots.LabelSnapshotMaxSize: "-1"}, defaultSize},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := s.writableSize(snapshots.Info{Labels: tc.labels})
+			assert.Equal(t, tc.want, got)
+		})
+	}
+
+	// Also verify behaviour when the snapshotter has no configured default:
+	// an unset/invalid label yields 0 (caller treats as "no size"), a valid
+	// label is respected.
+	t.Run("no-default-unset", func(t *testing.T) {
+		z := &snapshotter{defaultWritable: 0}
+		assert.Equal(t, int64(0), z.writableSize(snapshots.Info{}))
+	})
+	t.Run("no-default-with-label", func(t *testing.T) {
+		z := &snapshotter{defaultWritable: 0}
+		got := z.writableSize(snapshots.Info{Labels: map[string]string{
+			snapshots.LabelSnapshotMaxSize: "1048576",
+		}})
+		assert.Equal(t, int64(1048576), got)
+	})
+}
+
 func TestErofsFsverity(t *testing.T) {
 	testutil.RequiresRoot(t)
 	ctx := context.Background()
@@ -426,8 +498,10 @@ func TestCreateErofsMount(t *testing.T) {
 
 		assert.Equal(t, "erofs", m.Type)
 		assert.Equal(t, layerBlob, m.Source)
-		// X-containerd.dmverity=off overrides auto-detection when metadata exists
-		assert.Contains(t, m.Options, "X-containerd.dmverity=off")
+		// mode "off" skips dm-verity entirely - no dm-verity option in mount options
+		for _, opt := range m.Options {
+			assert.NotContains(t, opt, "X-containerd.dmverity=")
+		}
 	})
 }
 
@@ -663,7 +737,7 @@ func TestApplyDmverityPolicy(t *testing.T) {
 		assert.Empty(t, opt)
 	})
 
-	t.Run("mode off returns dmverity=off when metadata exists", func(t *testing.T) {
+	t.Run("mode off returns empty string when metadata exists", func(t *testing.T) {
 		createDmverityMetadata(t, layerBlob)
 
 		s := &snapshotter{
@@ -672,10 +746,10 @@ func TestApplyDmverityPolicy(t *testing.T) {
 
 		opt, err := s.applyDmverityPolicy(layerBlob)
 		require.NoError(t, err)
-		assert.Equal(t, "X-containerd.dmverity=off", opt)
+		assert.Empty(t, opt)
 	})
 
-	t.Run("mode on returns dmverity=on when metadata exists", func(t *testing.T) {
+	t.Run("mode on returns metadata path when metadata exists", func(t *testing.T) {
 		createDmverityMetadata(t, layerBlob)
 
 		s := &snapshotter{
@@ -684,10 +758,11 @@ func TestApplyDmverityPolicy(t *testing.T) {
 
 		opt, err := s.applyDmverityPolicy(layerBlob)
 		require.NoError(t, err)
-		assert.Equal(t, "X-containerd.dmverity=on", opt)
+		expectedPath := layerBlob + ".dmverity"
+		assert.Equal(t, "X-containerd.dmverity="+expectedPath, opt)
 	})
 
-	t.Run("mode auto returns empty string when metadata exists", func(t *testing.T) {
+	t.Run("mode auto returns metadata path when metadata exists", func(t *testing.T) {
 		createDmverityMetadata(t, layerBlob)
 
 		s := &snapshotter{
@@ -696,6 +771,539 @@ func TestApplyDmverityPolicy(t *testing.T) {
 
 		opt, err := s.applyDmverityPolicy(layerBlob)
 		require.NoError(t, err)
-		assert.Empty(t, opt) // auto mode doesn't add explicit option
+		expectedPath := layerBlob + ".dmverity"
+		assert.Equal(t, "X-containerd.dmverity="+expectedPath, opt)
 	})
+}
+
+func TestMountFsMeta(t *testing.T) {
+	root := t.TempDir()
+	s := &snapshotter{root: root}
+
+	parents := []string{"p0", "p1", "p2"}
+	for _, id := range parents {
+		require.NoError(t, os.MkdirAll(filepath.Join(root, "snapshots", id), 0755))
+	}
+
+	writeMeta := func(t *testing.T, id string, contents []byte) {
+		t.Helper()
+		require.NoError(t, os.WriteFile(s.fsMetaPath(id), contents, 0644))
+	}
+	removeMeta := func(t *testing.T, id string) {
+		t.Helper()
+		err := os.Remove(s.fsMetaPath(id))
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+	}
+
+	snap := storage.Snapshot{ParentIDs: parents}
+
+	t.Run("missing fsmeta returns false", func(t *testing.T) {
+		for _, id := range parents {
+			removeMeta(t, id)
+		}
+		_, ok := s.mountFsMeta(snap, 0)
+		assert.False(t, ok)
+	})
+
+	t.Run("empty fsmeta returns false", func(t *testing.T) {
+		writeMeta(t, "p0", nil)
+		t.Cleanup(func() { removeMeta(t, "p0") })
+
+		_, ok := s.mountFsMeta(snap, 0)
+		assert.False(t, ok)
+	})
+
+	t.Run("non-empty fsmeta on top parent returns mount with all device options", func(t *testing.T) {
+		writeMeta(t, "p0", []byte("merged"))
+		t.Cleanup(func() { removeMeta(t, "p0") })
+
+		m, ok := s.mountFsMeta(snap, 0)
+		require.True(t, ok)
+		assert.Equal(t, "erofs", m.Type)
+		assert.Equal(t, s.fsMetaPath("p0"), m.Source)
+		// Devices appended in reverse parent order from len-1 down to id.
+		assert.Equal(t, []string{
+			"ro", "loop",
+			"device=" + s.layerBlobPath("p2"),
+			"device=" + s.layerBlobPath("p1"),
+			"device=" + s.layerBlobPath("p0"),
+		}, m.Options)
+	})
+
+	t.Run("non-empty fsmeta on intermediate parent only references parents at or below id", func(t *testing.T) {
+		writeMeta(t, "p1", []byte("merged"))
+		t.Cleanup(func() { removeMeta(t, "p1") })
+
+		m, ok := s.mountFsMeta(snap, 1)
+		require.True(t, ok)
+		assert.Equal(t, s.fsMetaPath("p1"), m.Source)
+		assert.Equal(t, []string{
+			"ro", "loop",
+			"device=" + s.layerBlobPath("p2"),
+			"device=" + s.layerBlobPath("p1"),
+		}, m.Options)
+	})
+}
+
+// TestMountsWithMergedFsMeta covers s.mounts()'s assembly of the overlay
+// lowerdir when a merged fsmeta is present on a parent below the top of the
+// chain, i.e. one or more plain (non-merged) layers are stacked on top of a
+// merged fsmeta lower.
+func TestMountsWithMergedFsMeta(t *testing.T) {
+	root := t.TempDir()
+	s := &snapshotter{root: root}
+
+	// Chain (top to bottom): p0, p1, p2, p3. A merged fsmeta is only
+	// present for p2, flattening the sub-chain [p2, p3]. p0 and p1 are
+	// plain layers stacked on top of that merged base.
+	parents := []string{"p0", "p1", "p2", "p3"}
+	for _, id := range parents {
+		require.NoError(t, os.MkdirAll(filepath.Join(root, "snapshots", id), 0755))
+		require.NoError(t, os.WriteFile(s.layerBlobPath(id), []byte("layer"), 0644))
+	}
+	require.NoError(t, os.WriteFile(s.fsMetaPath("p2"), []byte("merged"), 0644))
+
+	snap := storage.Snapshot{Kind: snapshots.KindView, ParentIDs: parents}
+	info := snapshots.Info{}
+
+	mounts, err := s.mounts(snap, info)
+	require.NoError(t, err)
+
+	// Expect: [erofs(p0), erofs(p1), erofs(fsmeta p2, device=p3,p2), overlay]
+	require.Len(t, mounts, 4)
+
+	assert.Equal(t, "erofs", mounts[0].Type)
+	assert.Equal(t, s.layerBlobPath("p0"), mounts[0].Source)
+
+	assert.Equal(t, "erofs", mounts[1].Type)
+	assert.Equal(t, s.layerBlobPath("p1"), mounts[1].Source)
+
+	assert.Equal(t, "erofs", mounts[2].Type)
+	assert.Equal(t, s.fsMetaPath("p2"), mounts[2].Source)
+	assert.Equal(t, []string{
+		"ro", "loop",
+		"device=" + s.layerBlobPath("p3"),
+		"device=" + s.layerBlobPath("p2"),
+	}, mounts[2].Options)
+
+	// The overlay must span all three lowers (indices 0-2): the two plain
+	// top layers plus the merged fsmeta.
+	overlay := mounts[3]
+	assert.Equal(t, "format/mkdir/overlay", overlay.Type)
+	assert.Contains(t, overlay.Options, "lowerdir={{ overlay 0 2 }}")
+}
+
+// TestMountsWithMergedFsMetaOnTopParent covers the case where the merged
+// fsmeta is valid for the topmost parent, so it is the only lower. Since
+// overlayfs rejects a lowerdir with no upperdir, this collapses to a plain
+// bind mount instead.
+func TestMountsWithMergedFsMetaOnTopParent(t *testing.T) {
+	root := t.TempDir()
+	s := &snapshotter{root: root}
+
+	parents := []string{"p0", "p1"}
+	for _, id := range parents {
+		require.NoError(t, os.MkdirAll(filepath.Join(root, "snapshots", id), 0755))
+		require.NoError(t, os.WriteFile(s.layerBlobPath(id), []byte("layer"), 0644))
+	}
+	require.NoError(t, os.WriteFile(s.fsMetaPath("p0"), []byte("merged"), 0644))
+
+	snap := storage.Snapshot{Kind: snapshots.KindView, ParentIDs: parents}
+	info := snapshots.Info{}
+
+	mounts, err := s.mounts(snap, info)
+	require.NoError(t, err)
+
+	require.Len(t, mounts, 2)
+	assert.Equal(t, "erofs", mounts[0].Type)
+	assert.Equal(t, s.fsMetaPath("p0"), mounts[0].Source)
+	assert.Equal(t, []string{
+		"ro", "loop",
+		"device=" + s.layerBlobPath("p1"),
+		"device=" + s.layerBlobPath("p0"),
+	}, mounts[0].Options)
+
+	assert.Equal(t, "format/bind", mounts[1].Type)
+	assert.Equal(t, "{{ mount 0 }}", mounts[1].Source)
+}
+
+// --- layer content cache tests ---
+
+const (
+	cacheTestDiffID  = "sha256:0000000000000000000000000000000000000000000000000000000000000001"
+	cacheTestChainID = "sha256:0000000000000000000000000000000000000000000000000000000000000002"
+)
+
+// requireErofs skips a test unless the erofs kernel filesystem is available,
+// which NewSnapshotter requires. The layer content cache tests don't mount, so
+// they need neither root nor mkfs.erofs.
+func requireErofs(t *testing.T) {
+	t.Helper()
+	if !FindErofs() {
+		t.Skip("check for erofs kernel support failed, skipping test")
+	}
+}
+
+// writeCacheBlob writes a fake erofs blob into cacheDir keyed by diffID and
+// returns its absolute path. The bytes need not be a valid erofs image: the
+// snapshotter only symlinks the blob, so these tests exercise the
+// Prepare/Commit/Remove logic rather than mounting.
+func writeCacheBlob(t *testing.T, cacheDir string, diffID digest.Digest, data []byte) string {
+	t.Helper()
+	blob := erofsutils.CacheBlobPath(cacheDir, diffID)
+	require.NoError(t, os.MkdirAll(filepath.Dir(blob), 0755))
+	require.NoError(t, os.WriteFile(blob, data, 0644))
+	return blob
+}
+
+// extractionOpt builds the snapshot options the unpacker attaches to an
+// image-layer extraction Prepare (the snapshot.ref target and the diffID).
+func extractionOpt(target string, diffID digest.Digest) snapshots.Opt {
+	return snapshots.WithLabels(map[string]string{
+		snapshots.LabelSnapshotRef:    target,
+		snapshots.LabelSnapshotDiffID: diffID.String(),
+	})
+}
+
+// snapshotID returns the backend snapshot ID for key.
+func snapshotID(t *testing.T, ctx context.Context, s *snapshotter, key string) string {
+	t.Helper()
+	var id string
+	require.NoError(t, s.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
+		var err error
+		id, _, _, err = storage.GetInfo(ctx, key)
+		return err
+	}))
+	return id
+}
+
+// newCacheSnapshotter creates an erofs snapshotter rooted in a temp dir with the
+// given options, skipping the test if erofs is unavailable and registering the
+// snapshotter's cleanup.
+func newCacheSnapshotter(t *testing.T, opts ...Opt) *snapshotter {
+	t.Helper()
+	requireErofs(t)
+	sn, err := NewSnapshotter(t.TempDir(), opts...)
+	require.NoError(t, err)
+	t.Cleanup(func() { sn.Close() })
+	return sn.(*snapshotter)
+}
+
+// stageCacheHit runs an extraction Prepare for target/diffID and asserts the
+// cache staged the blob into the active snapshot: a read-only mount, with no
+// error (so the unpacker skips fetch+apply but still commits). It returns the
+// extraction key so the caller can Commit it as the target chainID.
+func stageCacheHit(t *testing.T, ctx context.Context, s *snapshotter, target string, diffID digest.Digest) string {
+	t.Helper()
+	key := "extract-1 " + target
+	mounts, err := s.Prepare(ctx, key, "", extractionOpt(target, diffID))
+	require.NoError(t, err, "cache hit must stage without an error")
+	require.NotEmpty(t, mounts, "a staged cache hit returns mounts")
+	for _, m := range mounts {
+		assert.True(t, m.ReadOnly(), "a staged cache hit returns read-only mounts")
+	}
+	return key
+}
+
+// TestCacheHit covers the happy path: an extraction Prepare whose diffID blob is
+// in the cache stages the blob into the active snapshot (symlinked) and returns
+// read-only mounts without committing; a subsequent Commit finalizes the target
+// chainID without re-converting.
+func TestCacheHit(t *testing.T) {
+	ctx := namespaces.WithNamespace(context.Background(), "test")
+
+	cacheDir := t.TempDir()
+	diffID := digest.Digest(cacheTestDiffID)
+	blob := writeCacheBlob(t, cacheDir, diffID, []byte("fake erofs blob"))
+
+	s := newCacheSnapshotter(t, WithLayerContentCaches(cacheDir))
+
+	target := cacheTestChainID
+	key := stageCacheHit(t, ctx, s, target, diffID)
+
+	// The blob is staged into the active snapshot but the target chainID is not
+	// committed yet.
+	_, err := s.Stat(ctx, target)
+	assert.Error(t, err, "target chainID must not be committed before Commit")
+
+	// layer.erofs is an absolute symlink into the operator-owned cache blob.
+	link := s.layerBlobPath(snapshotID(t, ctx, s, key))
+	fi, err := os.Lstat(link)
+	require.NoError(t, err)
+	assert.NotZero(t, fi.Mode()&os.ModeSymlink, "layer.erofs should be a symlink")
+	dst, err := os.Readlink(link)
+	require.NoError(t, err)
+	assert.True(t, filepath.IsAbs(dst), "symlink target should be absolute")
+	assert.Equal(t, blob, dst)
+
+	// Commit finalizes the staged snapshot as the target chainID, without any
+	// re-conversion (the blob is already present).
+	require.NoError(t, s.Commit(ctx, target, key))
+	info, err := s.Stat(ctx, target)
+	require.NoError(t, err, "committed snapshot must exist under the target chainID")
+	assert.Equal(t, snapshots.KindCommitted, info.Kind)
+	assert.Equal(t, "", info.Parent)
+}
+
+// TestCacheSidecar covers a hit in the default "auto" dm-verity mode where the
+// cache entry has a sidecar: it must be copied into the snapshot dir as a plain
+// regular file (not symlinked).
+func TestCacheSidecar(t *testing.T) {
+	ctx := namespaces.WithNamespace(context.Background(), "test")
+
+	cacheDir := t.TempDir()
+	diffID := digest.Digest(cacheTestDiffID)
+	blob := writeCacheBlob(t, cacheDir, diffID, []byte("fake erofs blob"))
+	require.NoError(t, os.WriteFile(dmverity.MetadataPath(blob), []byte(testDmverityMetadata), 0644))
+
+	// dmverity_mode defaults to "auto": use the sidecar if present.
+	s := newCacheSnapshotter(t, WithLayerContentCaches(cacheDir))
+
+	target := cacheTestChainID
+	key := stageCacheHit(t, ctx, s, target, diffID)
+
+	// The sidecar is copied in as a plain regular file (not a symlink) so mount-time
+	// metadata resolution is independent of the cache filesystem.
+	sidecar := dmverity.MetadataPath(s.layerBlobPath(snapshotID(t, ctx, s, key)))
+	fi, err := os.Lstat(sidecar)
+	require.NoError(t, err, "sidecar should be copied into the snapshot dir")
+	assert.Zero(t, fi.Mode()&os.ModeSymlink, "sidecar should be a regular file, not a symlink")
+	data, err := os.ReadFile(sidecar)
+	require.NoError(t, err)
+	assert.Equal(t, testDmverityMetadata, string(data))
+}
+
+// TestCacheMiss covers the cases that must NOT be served from the cache and
+// instead create a normal active snapshot: cache disabled, blob absent, a
+// label-less (container-rootfs) Prepare, and a View (which the KindActive gate
+// excludes even with matching labels and a cached blob).
+func TestCacheMiss(t *testing.T) {
+	ctx := namespaces.WithNamespace(context.Background(), "test")
+	diffID := digest.Digest(cacheTestDiffID)
+	target := cacheTestChainID
+
+	// Each case must leave the extraction as a normal active snapshot: mounts are
+	// returned and the target chainID is not committed. wantRO distinguishes a
+	// KindActive miss (no layer.erofs staged yet, so mounts must be writable)
+	// from the KindView case below (read-only for its own, cache-unrelated reason).
+	assertFellThrough := func(t *testing.T, s *snapshotter, mounts []mount.Mount, err error, wantRO bool) {
+		t.Helper()
+		require.NoError(t, err)
+		assert.NotEmpty(t, mounts, "a miss must return normal active-snapshot mounts")
+		for _, m := range mounts {
+			assert.Equal(t, wantRO, m.ReadOnly())
+		}
+		_, err = s.Stat(ctx, target)
+		assert.Error(t, err, "target chainID must not be committed on a miss")
+	}
+
+	t.Run("cache disabled", func(t *testing.T) {
+		s := newCacheSnapshotter(t) // no cache configured
+		mounts, err := s.Prepare(ctx, "extract-1 "+target, "", extractionOpt(target, diffID))
+		assertFellThrough(t, s, mounts, err, false)
+	})
+
+	t.Run("blob absent", func(t *testing.T) {
+		s := newCacheSnapshotter(t, WithLayerContentCaches(t.TempDir()))
+		mounts, err := s.Prepare(ctx, "extract-1 "+target, "", extractionOpt(target, diffID))
+		assertFellThrough(t, s, mounts, err, false)
+	})
+
+	t.Run("no extraction labels", func(t *testing.T) {
+		cacheDir := t.TempDir()
+		writeCacheBlob(t, cacheDir, diffID, []byte("blob"))
+		s := newCacheSnapshotter(t, WithLayerContentCaches(cacheDir))
+		// A container-rootfs Prepare carries no snapshot.ref/diff-id labels.
+		mounts, err := s.Prepare(ctx, "container-rootfs", "")
+		require.NoError(t, err)
+		assert.NotEmpty(t, mounts)
+	})
+
+	t.Run("view is never short-circuited", func(t *testing.T) {
+		cacheDir := t.TempDir()
+		writeCacheBlob(t, cacheDir, diffID, []byte("blob"))
+		s := newCacheSnapshotter(t, WithLayerContentCaches(cacheDir))
+		// Even with matching labels and a cached blob, a View must not commit.
+		// It's read-only, but via the KindView roFlag in mounts(), not the cache.
+		mounts, err := s.View(ctx, "view-1", "", extractionOpt(target, diffID))
+		assertFellThrough(t, s, mounts, err, true)
+	})
+}
+
+// TestCacheParentedPrepare covers a cached blob whose extraction Prepare carries
+// a parent (the sequential unpack path): it must not be staged. mounts() only
+// picks a staged blob up when the snapshot has no parents, so otherwise the
+// unpacker would see a writable overlay, apply the layer, and let the differ
+// write through the symlink into the shared cache blob.
+func TestCacheParentedPrepare(t *testing.T) {
+	ctx := namespaces.WithNamespace(context.Background(), "test")
+
+	var (
+		cacheDir     = t.TempDir()
+		parentDiffID = digest.Digest(cacheTestDiffID)
+		parentChain  = cacheTestChainID
+		childDiffID  = digest.Digest("sha256:0000000000000000000000000000000000000000000000000000000000000003")
+		childChain   = "sha256:0000000000000000000000000000000000000000000000000000000000000004"
+	)
+	writeCacheBlob(t, cacheDir, parentDiffID, []byte("fake parent blob"))
+	writeCacheBlob(t, cacheDir, childDiffID, []byte("fake child blob"))
+
+	s := newCacheSnapshotter(t, WithLayerContentCaches(cacheDir))
+
+	// The first layer has no parent, so it is served from the cache as usual.
+	require.NoError(t, s.Commit(ctx, parentChain, stageCacheHit(t, ctx, s, parentChain, parentDiffID)))
+
+	key := "extract-1 " + childChain
+	mounts, err := s.Prepare(ctx, key, parentChain, extractionOpt(childChain, childDiffID))
+	require.NoError(t, err)
+	require.NotEmpty(t, mounts)
+	// The unpacker only inspects the last mount, which must be the writable
+	// overlay so the layer gets applied (the parents' lowers are read-only).
+	assert.False(t, mounts[len(mounts)-1].ReadOnly(), "a parented Prepare must expose a writable overlay")
+
+	// Nothing was staged, so the differ has no symlink to write through.
+	_, err = os.Lstat(s.layerBlobPath(snapshotID(t, ctx, s, key)))
+	assert.ErrorIs(t, err, os.ErrNotExist, "no cached blob may be staged into a parented snapshot")
+}
+
+// TestCacheRemove covers removal of a cache-hit snapshot: it succeeds (the
+// setImmutable guard skips the symlink), removes the snapshot dir/symlink, and
+// leaves the operator-owned cache blob and sidecar untouched.
+func TestCacheRemove(t *testing.T) {
+	ctx := namespaces.WithNamespace(context.Background(), "test")
+
+	cacheDir := t.TempDir()
+	diffID := digest.Digest(cacheTestDiffID)
+	blob := writeCacheBlob(t, cacheDir, diffID, []byte("fake erofs blob"))
+	sidecar := dmverity.MetadataPath(blob)
+	require.NoError(t, os.WriteFile(sidecar, []byte(testDmverityMetadata), 0644))
+
+	s := newCacheSnapshotter(t, WithLayerContentCaches(cacheDir))
+
+	target := cacheTestChainID
+	key := stageCacheHit(t, ctx, s, target, diffID)
+	require.NoError(t, s.Commit(ctx, target, key))
+
+	snapDir := filepath.Dir(s.layerBlobPath(snapshotID(t, ctx, s, target)))
+
+	// Remove must succeed (the symlinked blob is skipped by the setImmutable guard,
+	// which would otherwise follow the link and ioctl the operator-owned blob).
+	require.NoError(t, s.Remove(ctx, target))
+
+	// The snapshot dir (and its symlink) is gone, but the cache is untouched.
+	_, err := os.Stat(snapDir)
+	assert.True(t, os.IsNotExist(err), "snapshot dir should be removed")
+	_, err = os.Stat(blob)
+	require.NoError(t, err, "cache blob must be untouched by Remove")
+	_, err = os.Stat(sidecar)
+	require.NoError(t, err, "cache sidecar must be untouched by Remove")
+}
+
+// TestCacheDmverity covers dmverity_mode="on": a cache entry with a sidecar is
+// staged (and the sidecar copied), while an entry missing its required sidecar is
+// a hard error (not staged, nothing committed).
+func TestCacheDmverity(t *testing.T) {
+	if supported, err := dmverity.IsSupported(); err != nil || !supported {
+		t.Skip("dm-verity is not supported on this system")
+	}
+	ctx := namespaces.WithNamespace(context.Background(), "test")
+	diffID := digest.Digest(cacheTestDiffID)
+	target := cacheTestChainID
+
+	t.Run("with sidecar stages and copies it", func(t *testing.T) {
+		cacheDir := t.TempDir()
+		blob := writeCacheBlob(t, cacheDir, diffID, []byte("fake erofs blob"))
+		require.NoError(t, os.WriteFile(dmverity.MetadataPath(blob), []byte(testDmverityMetadata), 0644))
+
+		s := newCacheSnapshotter(t, WithLayerContentCaches(cacheDir), WithDmverityMode("on"))
+		key := stageCacheHit(t, ctx, s, target, diffID)
+
+		_, err := os.Stat(dmverity.MetadataPath(s.layerBlobPath(snapshotID(t, ctx, s, key))))
+		require.NoError(t, err, "sidecar must be present for a dmverity_mode=on hit")
+	})
+
+	t.Run("without sidecar fails the pull", func(t *testing.T) {
+		cacheDir := t.TempDir()
+		writeCacheBlob(t, cacheDir, diffID, []byte("fake erofs blob")) // no sidecar
+
+		s := newCacheSnapshotter(t, WithLayerContentCaches(cacheDir), WithDmverityMode("on"))
+
+		// dmverity_mode=on requires a sidecar; a cache entry without one is a hard
+		// error rather than a silent fallback.
+		mounts, err := s.Prepare(ctx, "extract-1 "+target, "", extractionOpt(target, diffID))
+		require.Error(t, err)
+		assert.Nil(t, mounts, "missing sidecar must not be treated as a hit")
+		_, err = s.Stat(ctx, target)
+		assert.Error(t, err, "no snapshot should be committed on failure")
+	})
+}
+
+// TestCacheMultipleDirs covers the layer_content_caches search path: directories
+// are searched in configured order, the first hit wins, later caches are reached
+// when earlier ones lack the blob, and a miss in every cache falls through to a
+// normal writable snapshot.
+func TestCacheMultipleDirs(t *testing.T) {
+	ctx := namespaces.WithNamespace(context.Background(), "test")
+	diffID := digest.Digest(cacheTestDiffID)
+	target := cacheTestChainID
+
+	// stagedBlob returns the cache blob the snapshot's layer.erofs symlink points
+	// at, i.e. which of the configured caches actually served the layer.
+	stagedBlob := func(t *testing.T, s *snapshotter, key string) string {
+		t.Helper()
+		dst, err := os.Readlink(s.layerBlobPath(snapshotID(t, ctx, s, key)))
+		require.NoError(t, err)
+		return dst
+	}
+
+	t.Run("first cache with the blob wins", func(t *testing.T) {
+		first, second := t.TempDir(), t.TempDir()
+		// Both caches hold the diffID; the earlier one must be the one used.
+		firstBlob := writeCacheBlob(t, first, diffID, []byte("from first"))
+		writeCacheBlob(t, second, diffID, []byte("from second"))
+
+		s := newCacheSnapshotter(t, WithLayerContentCaches(first, second))
+		key := stageCacheHit(t, ctx, s, target, diffID)
+		assert.Equal(t, firstBlob, stagedBlob(t, s, key))
+	})
+
+	t.Run("falls through to a later cache", func(t *testing.T) {
+		empty, populated := t.TempDir(), t.TempDir()
+		blob := writeCacheBlob(t, populated, diffID, []byte("from second"))
+
+		s := newCacheSnapshotter(t, WithLayerContentCaches(empty, populated))
+		key := stageCacheHit(t, ctx, s, target, diffID)
+		assert.Equal(t, blob, stagedBlob(t, s, key))
+	})
+
+	t.Run("miss in every cache falls back to a writable snapshot", func(t *testing.T) {
+		s := newCacheSnapshotter(t, WithLayerContentCaches(
+			filepath.Join(t.TempDir(), "missing"), t.TempDir(), t.TempDir()))
+
+		mounts, err := s.Prepare(ctx, "extract-1 "+target, "", extractionOpt(target, diffID))
+		require.NoError(t, err)
+		require.NotEmpty(t, mounts)
+		for _, m := range mounts {
+			assert.False(t, m.ReadOnly(), "a miss in every cache must return writable mounts")
+		}
+		_, err = s.Stat(ctx, target)
+		assert.Error(t, err, "target chainID must not be committed on a miss")
+	})
+}
+
+// TestCacheDirMustBeAbsolute covers the one thing NewSnapshotter checks about a
+// configured cache dir: it must be absolute, since a relative one would be
+// symlinked into the snapshot dir and dangle. The empty string is covered by the
+// same check, which otherwise resolves to the daemon's working directory.
+func TestCacheDirMustBeAbsolute(t *testing.T) {
+	requireErofs(t)
+
+	for _, dir := range []string{"relative-cache", "./cache", "", "a/b"} {
+		t.Run(fmt.Sprintf("%q", dir), func(t *testing.T) {
+			_, err := NewSnapshotter(t.TempDir(), WithLayerContentCaches(dir))
+			assert.ErrorContains(t, err, "must be an absolute path")
+		})
+	}
 }

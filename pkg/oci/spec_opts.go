@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"maps"
 	"math"
@@ -45,6 +46,7 @@ import (
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/containerd/v2/internal/fsview"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 )
 
@@ -619,9 +621,7 @@ func WithUser(userstr string) SpecOpts {
 		// The `Username` field on the runtime spec is marked by Platform as only for Windows, and in this case it
 		// *is* being set on a Windows host at least, but will be used as a temporary holding spot until the guest
 		// can use the string to perform these same operations to grab the uid:gid inside.
-		//
-		// Mounts are not supported on Darwin, so using the same workaround.
-		if (s.Windows != nil && s.Linux != nil) || runtime.GOOS == "darwin" {
+		if s.Windows != nil && s.Linux != nil {
 			s.Process.User.Username = userstr
 			return nil
 		}
@@ -630,9 +630,15 @@ func WithUser(userstr string) SpecOpts {
 		switch len(parts) {
 		case 1:
 			v, err := strconv.Atoi(parts[0])
-			if err != nil || v < minUserID || v > maxUserID {
-				// if we cannot parse as an int32 then try to see if it is a username
+			if err != nil {
+				if errors.Is(err, strconv.ErrRange) {
+					return fmt.Errorf("invalid USER value %q: uid out of range", userstr)
+				}
+				// Non-numeric user value; treat it as a username.
 				return WithUsername(userstr)(ctx, client, c, s)
+			}
+			if v < minUserID || v > maxUserID {
+				return fmt.Errorf("invalid USER value %q: uid out of range", userstr)
 			}
 			return WithUserID(uint32(v))(ctx, client, c, s)
 		case 2:
@@ -642,14 +648,24 @@ func WithUser(userstr string) SpecOpts {
 			)
 			var uid, gid uint32
 			v, err := strconv.Atoi(parts[0])
-			if err != nil || v < minUserID || v > maxUserID {
+			if err != nil {
+				if errors.Is(err, strconv.ErrRange) {
+					return fmt.Errorf("invalid USER value %q: uid out of range", userstr)
+				}
 				username = parts[0]
+			} else if v < minUserID || v > maxUserID {
+				return fmt.Errorf("invalid USER value %q: uid out of range", userstr)
 			} else {
 				uid = uint32(v)
 			}
 			v, err = strconv.Atoi(parts[1])
-			if err != nil || v < minGroupID || v > maxGroupID {
+			if err != nil {
+				if errors.Is(err, strconv.ErrRange) {
+					return fmt.Errorf("invalid USER value %q: gid out of range", userstr)
+				}
 				groupname = parts[1]
+			} else if v < minGroupID || v > maxGroupID {
+				return fmt.Errorf("invalid USER value %q: gid out of range", userstr)
 			} else {
 				gid = uint32(v)
 			}
@@ -748,7 +764,7 @@ func WithUserID(uid uint32) SpecOpts {
 				return u.Uid == int(uid)
 			})
 			if err != nil {
-				if os.IsNotExist(err) || errors.Is(err, ErrNoUsersFound) {
+				if errors.Is(err, fs.ErrNotExist) || errors.Is(err, ErrNoUsersFound) {
 					s.Process.User.UID, s.Process.User.GID = uid, 0
 					return nil
 				}
@@ -852,8 +868,8 @@ func WithUsername(username string) SpecOpts {
 // The passed in user can be either a uid or a username.
 func WithAdditionalGIDs(userstr string) SpecOpts {
 	return func(ctx context.Context, client Client, c *containers.Container, s *Spec) (err error) {
-		// For LCOW or on Darwin additional GID's not supported
-		if s.Windows != nil || runtime.GOOS == "darwin" {
+		// For LCOW additional GID's not supported
+		if s.Windows != nil {
 			return nil
 		}
 		setProcess(s)
@@ -867,7 +883,7 @@ func WithAdditionalGIDs(userstr string) SpecOpts {
 					return u.Uid == uid
 				})
 				if err != nil {
-					if os.IsNotExist(err) || errors.Is(err, ErrNoUsersFound) {
+					if errors.Is(err, fs.ErrNotExist) || errors.Is(err, ErrNoUsersFound) {
 						return nil
 					}
 					return err
@@ -884,7 +900,7 @@ func WithAdditionalGIDs(userstr string) SpecOpts {
 				return slices.Contains(g.List, username)
 			})
 			if err != nil {
-				if os.IsNotExist(err) {
+				if errors.Is(err, fs.ErrNotExist) {
 					return nil
 				}
 				return err
@@ -924,6 +940,15 @@ func WithAdditionalGIDs(userstr string) SpecOpts {
 }
 
 func withReadonlyFS(ctx context.Context, client Client, mounts []mount.Mount, fn func(fs.FS) error) error {
+	// Try to avoid mount if possible by using fsview to directly open
+	// overlay/erofs/bind mounts without actually mounting them
+	if viewFS, err := fsview.FSMounts(mounts); err == nil && viewFS != nil {
+		defer viewFS.Close()
+		return fn(viewFS)
+	} else if !errors.Is(err, errdefs.ErrNotImplemented) || runtime.GOOS == "darwin" {
+		return err
+	}
+
 	var mm mount.Manager
 	if cwm, ok := client.(interface{ MountManager() mount.Manager }); ok {
 		mm = cwm.MountManager()
@@ -959,8 +984,8 @@ func withReadonlyFS(ctx context.Context, client Client, mounts []mount.Mount, fn
 // The passed in groups can be either a gid or a groupname.
 func WithAppendAdditionalGroups(groups ...string) SpecOpts {
 	return func(ctx context.Context, client Client, c *containers.Container, s *Spec) (err error) {
-		// For LCOW or on Darwin additional GID's are not supported
-		if s.Windows != nil || runtime.GOOS == "darwin" {
+		// For LCOW additional GID's are not supported
+		if s.Windows != nil {
 			return nil
 		}
 		setProcess(s)
@@ -975,7 +1000,7 @@ func WithAppendAdditionalGroups(groups ...string) SpecOpts {
 				if groupErr != nil {
 					return groupErr
 				}
-			} else if !os.IsNotExist(groupErr) {
+			} else if !errors.Is(groupErr, fs.ErrNotExist) {
 				return groupErr
 			}
 
@@ -1815,10 +1840,13 @@ type readLinker interface {
 // openUserFile attempts to open a file within the root fs.
 // It handles cases where the file is an absolute symlink (e.g., NixOS /etc/passwd -> /nix/store/...),
 // which triggers "path escapes from parent" errors in Go 1.24+ due to stricter os.DirFS validation.
+//
+// The returned file rejects non-regular sources and returns an error if more
+// than maxUserFileBytes are read from it.
 func openUserFile(root fs.FS, name string) (fs.File, error) {
 	f, err := root.Open(name)
 	if err == nil {
-		return f, nil
+		return wrapUserFile(f, name)
 	}
 
 	// Check if the FS implements our local ReadLink interface.
@@ -1835,7 +1863,11 @@ func openUserFile(root fs.FS, name string) (fs.File, error) {
 				if rerr == nil {
 					// filepath.Rel might return OS-specific separators (backslashes on Windows).
 					// fs.Open strictly expects forward slashes, so we convert it.
-					return root.Open(filepath.ToSlash(rel))
+					f, oerr := root.Open(filepath.ToSlash(rel))
+					if oerr != nil {
+						return nil, oerr
+					}
+					return wrapUserFile(f, name)
 				}
 			}
 		}
@@ -1843,4 +1875,48 @@ func openUserFile(root fs.FS, name string) (fs.File, error) {
 
 	// Return the original error if we couldn't resolve it
 	return nil, err
+}
+
+// maxUserFileBytes caps how much data is read from any user-database file
+// opened via openUserFile. Real systems keep these files well under 1 MiB;
+// 10 MiB is generous headroom while keeping peak memory during
+// user.ParsePasswd/ParseGroup bounded to single-digit MiB.
+const maxUserFileBytes = 10 << 20
+
+// wrapUserFile rejects non-regular sources and returns an fs.File that
+// errors out if more than maxUserFileBytes are read from it.
+func wrapUserFile(f fs.File, name string) (fs.File, error) {
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, fmt.Errorf("stat %s: %w", name, err)
+	}
+	if !info.Mode().IsRegular() {
+		f.Close()
+		return nil, fmt.Errorf("%s is not a regular file", name)
+	}
+	return &limitedFile{
+		File: f,
+		// Allow one byte past the cap so an overflow surfaces as an
+		// error rather than a silent EOF that the parser would treat as
+		// a clean end-of-file (and miss any entries past the cap).
+		r:    &io.LimitedReader{R: f, N: maxUserFileBytes + 1},
+		name: name,
+	}, nil
+}
+
+// limitedFile is an fs.File whose Read returns an error once more than
+// maxUserFileBytes have been read.
+type limitedFile struct {
+	fs.File
+	r    *io.LimitedReader
+	name string
+}
+
+func (l *limitedFile) Read(p []byte) (int, error) {
+	n, err := l.r.Read(p)
+	if l.r.N == 0 {
+		return n, fmt.Errorf("%q exceeds %d bytes", l.name, maxUserFileBytes)
+	}
+	return n, err
 }

@@ -49,7 +49,7 @@ func TestHTTPResolver(t *testing.T) {
 		s := httptest.NewServer(h)
 
 		options := ResolverOptions{}
-		base := s.URL[7:] // strip "http://"
+		base := s.URL[len("http://"):]
 		return base, options, s.Close
 	}
 	runBasicTest(t, "testname", s)
@@ -69,7 +69,7 @@ func TestResolverOptionsRace(t *testing.T) {
 		options := ResolverOptions{
 			Headers: header,
 		}
-		base := s.URL[7:] // strip "http://"
+		base := s.URL[len("http://"):]
 		return base, options, s.Close
 	}
 
@@ -315,7 +315,7 @@ func TestWrongBasicAuthResolver(t *testing.T) {
 func TestHostFailureFallbackResolver(t *testing.T) {
 	sf := func(h http.Handler) (string, ResolverOptions, func()) {
 		s := httptest.NewServer(h)
-		base := s.URL[7:] // strip "http://"
+		base := s.URL[len("http://"):]
 
 		options := ResolverOptions{}
 		createHost := func(host string) RegistryHost {
@@ -597,7 +597,7 @@ func TestResolveProxyFallback(t *testing.T) {
 	s := httptest.NewServer(logHandler{t, nr})
 	defer s.Close()
 
-	base := s.URL[7:] // strip "http://"
+	base := s.URL[len("http://"):]
 
 	ro := ResolverOptions{
 		Hosts: func(host string) ([]RegistryHost, error) {
@@ -762,6 +762,197 @@ func TestRequestSanitize(t *testing.T) {
 			assert.Equal(t, tc.expected, tc.request.sanitizedURL())
 		})
 	}
+}
+
+type fakeTimeoutErr struct{}
+
+func (fakeTimeoutErr) Error() string   { return "fake timeout" }
+func (fakeTimeoutErr) Timeout() bool   { return true }
+func (fakeTimeoutErr) Temporary() bool { return true }
+
+func TestIsTransientTransportErr(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "net timeout", err: fakeTimeoutErr{}, want: true},
+		{name: "wrapped net timeout", err: fmt.Errorf("wrapped: %w", fakeTimeoutErr{}), want: true},
+		{name: "io.EOF", err: io.EOF, want: true},
+		{name: "io.ErrUnexpectedEOF", err: io.ErrUnexpectedEOF, want: true},
+		{name: "wrapped io.EOF", err: fmt.Errorf("wrapped: %w", io.EOF), want: true},
+		{name: "generic error not transient", err: errors.New("nope"), want: false},
+		{name: "context canceled not transient", err: context.Canceled, want: false},
+		{name: "context deadline exceeded not transient", err: context.DeadlineExceeded, want: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := isTransientTransportErr(tc.err)
+			if got != tc.want {
+				t.Errorf("isTransientTransportErr(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// rtFunc lets a test stub a single RoundTrip per call. The RoundTripper is
+// invoked once per attempt, so the slice length controls how many calls to
+// service before falling off the end.
+type rtFunc func(req *http.Request) (*http.Response, error)
+
+func (f rtFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+func newSequenceRT(t *testing.T, results []error, calls *int) http.RoundTripper {
+	t.Helper()
+	return rtFunc(func(req *http.Request) (*http.Response, error) {
+		i := *calls
+		(*calls)++
+		if i >= len(results) {
+			t.Fatalf("RoundTrip called %d times, only %d results queued", i+1, len(results))
+		}
+		if err := results[i]; err != nil {
+			return nil, err
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader("ok")),
+			Header:     http.Header{},
+			Request:    req,
+		}, nil
+	})
+}
+
+func newTransportRetryRequest(rt http.RoundTripper) *request {
+	return &request{
+		method: http.MethodGet,
+		path:   "/v2/",
+		header: http.Header{},
+		host: RegistryHost{
+			Client: &http.Client{Transport: rt},
+			Host:   "example.test",
+			Scheme: "https",
+		},
+	}
+}
+
+func TestDoWithTransportRetries(t *testing.T) {
+	t.Run("success without retry", func(t *testing.T) {
+		var calls int
+		attempts := 3
+		r := newTransportRetryRequest(newSequenceRT(t, []error{nil}, &calls))
+		resp, err := r.doWithTransportRetries(context.Background(), &attempts, true)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		resp.Body.Close()
+		if calls != 1 {
+			t.Errorf("expected 1 call, got %d", calls)
+		}
+		if attempts != 2 {
+			t.Errorf("expected 1 attempt consumed (2 remaining), got %d", attempts)
+		}
+	})
+
+	t.Run("retries transient then succeeds", func(t *testing.T) {
+		var calls int
+		attempts := 3
+		results := []error{fakeTimeoutErr{}, nil}
+		r := newTransportRetryRequest(newSequenceRT(t, results, &calls))
+		resp, err := r.doWithTransportRetries(context.Background(), &attempts, true)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		resp.Body.Close()
+		if calls != 2 {
+			t.Errorf("expected 2 calls, got %d", calls)
+		}
+		if attempts != 1 {
+			t.Errorf("expected 2 attempts consumed (1 remaining), got %d", attempts)
+		}
+	})
+
+	t.Run("gives up when attempts exhausted on transient", func(t *testing.T) {
+		var calls int
+		attempts := 3
+		results := []error{fakeTimeoutErr{}, fakeTimeoutErr{}, fakeTimeoutErr{}}
+		r := newTransportRetryRequest(newSequenceRT(t, results, &calls))
+		_, err := r.doWithTransportRetries(context.Background(), &attempts, true)
+		if err == nil {
+			t.Fatal("expected error after attempts exhausted, got nil")
+		}
+		var netErr net.Error
+		if !errors.As(err, &netErr) || !netErr.Timeout() {
+			t.Errorf("expected timeout error to be returned, got %v", err)
+		}
+		if calls != 3 {
+			t.Errorf("expected 3 calls, got %d", calls)
+		}
+		if attempts != 0 {
+			t.Errorf("expected attempts fully consumed, got %d remaining", attempts)
+		}
+	})
+
+	t.Run("non-transient error is not retried", func(t *testing.T) {
+		var calls int
+		attempts := 3
+		nonTransient := errors.New("connection refused")
+		results := []error{nonTransient}
+		r := newTransportRetryRequest(newSequenceRT(t, results, &calls))
+		_, err := r.doWithTransportRetries(context.Background(), &attempts, true)
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !errors.Is(err, nonTransient) {
+			t.Errorf("expected error %v, got %v", nonTransient, err)
+		}
+		if calls != 1 {
+			t.Errorf("expected 1 call, got %d", calls)
+		}
+		if attempts != 2 {
+			t.Errorf("expected 1 attempt consumed (2 remaining), got %d", attempts)
+		}
+	})
+
+	t.Run("non-last host skips retry", func(t *testing.T) {
+		var calls int
+		attempts := 3
+		results := []error{fakeTimeoutErr{}}
+		r := newTransportRetryRequest(newSequenceRT(t, results, &calls))
+		_, err := r.doWithTransportRetries(context.Background(), &attempts, false)
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if calls != 1 {
+			t.Errorf("expected 1 call when not last host, got %d", calls)
+		}
+		if attempts != 2 {
+			t.Errorf("expected 1 attempt consumed (2 remaining), got %d", attempts)
+		}
+	})
+
+	t.Run("context cancellation during backoff", func(t *testing.T) {
+		var calls int
+		attempts := 3
+
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+
+		// Cancel the context synchronously from within the RoundTripper so that
+		// ctx.Done() is already closed by the time the backoff select is reached,
+		// making the test deterministic without relying on scheduling or timing.
+		r := newTransportRetryRequest(rtFunc(func(req *http.Request) (*http.Response, error) {
+			calls++
+			cancel()
+			return nil, fakeTimeoutErr{}
+		}))
+		_, err := r.doWithTransportRetries(ctx, &attempts, true)
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("expected context.Canceled, got %v", err)
+		}
+		if calls != 1 {
+			t.Errorf("expected 1 call before cancellation, got %d", calls)
+		}
+	})
 }
 
 func flipLocalhost(host string) string {
@@ -1361,5 +1552,252 @@ func (srv *refreshTokenServer) BasicTestFunc() func(h http.Handler) (string, Res
 			WithAuthorizer(authorizer),
 		)
 		return base, options, close
+	}
+}
+
+func TestResolverErrorStatusCodeOnFetch(t *testing.T) {
+	ctx := context.Background()
+
+	testCases := []struct {
+		name       string
+		statusCode int
+	}{
+		{"BadRequest", http.StatusBadRequest},
+		{"NotFound", http.StatusNotFound},
+		{"InternalServerError", http.StatusInternalServerError},
+		{"BadGateway", http.StatusBadGateway},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/manifests/") {
+					// Return the error status code for the GET request
+					rw.WriteHeader(tc.statusCode)
+					return
+				}
+				rw.WriteHeader(http.StatusOK)
+			}))
+			defer s.Close()
+
+			base := s.URL[len("http://"):]
+			options := ResolverOptions{}
+			resolver := NewResolver(options)
+
+			image := fmt.Sprintf("%s/library/hello-world:latest", base)
+			_, _, err := resolver.Resolve(ctx, image)
+
+			if err == nil {
+				t.Fatalf("expected error for status code %d", tc.statusCode)
+			}
+
+			var rerr remoteerrors.ErrUnexpectedStatus
+			if !errors.As(err, &rerr) {
+				t.Fatalf("expected ErrUnexpectedStatus, got %T: %v", err, err)
+			}
+
+			if rerr.StatusCode != tc.statusCode {
+				t.Fatalf("expected status code %d, got %d", tc.statusCode, rerr.StatusCode)
+			}
+		})
+	}
+}
+
+func TestResolveForbiddenGETFallbackForErrorBody(t *testing.T) {
+	// When HEAD returns 403 with no body, the resolver should issue a
+	// follow-up GET to retrieve the registry's error details.
+	const (
+		name      = "test/repo"
+		tag       = "latest"
+		errorBody = `{"errors":[{"code":"DENIED","message":"encryption key is disabled"}]}`
+	)
+
+	handler := http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/token") {
+			rw.Header().Set("Content-Type", "application/json")
+			rw.Write([]byte(`{"access_token":"test"}`))
+			return
+		}
+		if strings.Contains(r.URL.Path, "/manifests/") {
+			rw.Header().Set("Content-Type", "application/json")
+			rw.WriteHeader(http.StatusForbidden)
+			if r.Method == http.MethodGet {
+				rw.Write([]byte(errorBody))
+			}
+			return
+		}
+		if r.URL.Path == "/v2/" {
+			rw.WriteHeader(http.StatusOK)
+			return
+		}
+		rw.WriteHeader(http.StatusNotFound)
+	})
+
+	base, options, close := tlsServer(handler)
+	defer close()
+
+	options.Hosts = ConfigureDefaultRegistries(WithClient(options.Client))
+	resolver := NewResolver(options)
+	ref := fmt.Sprintf("%s/%s:%s", base, name, tag)
+
+	_, _, err := resolver.Resolve(context.Background(), ref)
+	if err == nil {
+		t.Fatal("expected error from resolve, got nil")
+	}
+
+	errMsg := err.Error()
+	if !strings.Contains(errMsg, "encryption key is disabled") {
+		t.Errorf("expected error to contain registry error body, got: %s", errMsg)
+	}
+	if !strings.Contains(errMsg, "403") {
+		t.Errorf("expected error to contain status code 403, got: %s", errMsg)
+	}
+}
+
+func TestResolveForbiddenNoFallbackOnGET(t *testing.T) {
+	const (
+		name = "test/repo"
+		tag  = "latest"
+	)
+
+	var getCount int
+	handler := http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/token") {
+			rw.Header().Set("Content-Type", "application/json")
+			rw.Write([]byte(`{"access_token":"test"}`))
+			return
+		}
+		if strings.Contains(r.URL.Path, "/manifests/") {
+			if r.Method == http.MethodGet {
+				getCount++
+			}
+			rw.Header().Set("Content-Type", "application/json")
+			rw.WriteHeader(http.StatusForbidden)
+			rw.Write([]byte(`{"errors":[{"code":"DENIED","message":"forbidden"}]}`))
+			return
+		}
+		if r.URL.Path == "/v2/" {
+			rw.WriteHeader(http.StatusOK)
+			return
+		}
+		rw.WriteHeader(http.StatusNotFound)
+	})
+
+	base, options, close := tlsServer(handler)
+	defer close()
+
+	options.Hosts = ConfigureDefaultRegistries(WithClient(options.Client))
+	resolver := NewResolver(options)
+	ref := fmt.Sprintf("%s/%s:%s", base, name, tag)
+
+	_, _, err := resolver.Resolve(context.Background(), ref)
+	if err == nil {
+		t.Fatal("expected error from resolve, got nil")
+	}
+
+	// The resolver should issue exactly 1 GET (the fallback from HEAD 403).
+	// It must NOT issue a second fallback GET when the first GET also returns 403.
+	if getCount != 1 {
+		t.Errorf("expected exactly 1 GET fallback request for manifests, got %d", getCount)
+	}
+}
+
+func TestResolve404NoFallbackGET(t *testing.T) {
+	const (
+		name = "test/repo"
+		tag  = "latest"
+	)
+
+	var getCount int
+	handler := http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/token") {
+			rw.Header().Set("Content-Type", "application/json")
+			rw.Write([]byte(`{"access_token":"test"}`))
+			return
+		}
+		if strings.Contains(r.URL.Path, "/manifests/") {
+			if r.Method == http.MethodGet {
+				getCount++
+			}
+			rw.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if r.URL.Path == "/v2/" {
+			rw.WriteHeader(http.StatusOK)
+			return
+		}
+		rw.WriteHeader(http.StatusNotFound)
+	})
+
+	base, options, close := tlsServer(handler)
+	defer close()
+
+	options.Hosts = ConfigureDefaultRegistries(WithClient(options.Client))
+	resolver := NewResolver(options)
+	ref := fmt.Sprintf("%s/%s:%s", base, name, tag)
+
+	_, _, err := resolver.Resolve(context.Background(), ref)
+	if err == nil {
+		t.Fatal("expected error from resolve, got nil")
+	}
+
+	if getCount != 0 {
+		t.Errorf("expected 0 GET requests for 404, got %d", getCount)
+	}
+}
+
+func TestResolveForbiddenGETFallbackNetworkError(t *testing.T) {
+	const (
+		name = "test/repo"
+		tag  = "latest"
+	)
+
+	var requestCount int
+	handler := http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/token") {
+			rw.Header().Set("Content-Type", "application/json")
+			rw.Write([]byte(`{"access_token":"test"}`))
+			return
+		}
+		if strings.Contains(r.URL.Path, "/manifests/") {
+			requestCount++
+			if r.Method == http.MethodHead {
+				rw.WriteHeader(http.StatusForbidden)
+				return
+			}
+			hj, ok := rw.(http.Hijacker)
+			if !ok {
+				rw.WriteHeader(http.StatusForbidden)
+				return
+			}
+			conn, _, err := hj.Hijack()
+			if err != nil {
+				rw.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			conn.Close()
+			return
+		}
+		if r.URL.Path == "/v2/" {
+			rw.WriteHeader(http.StatusOK)
+			return
+		}
+		rw.WriteHeader(http.StatusNotFound)
+	})
+
+	base, options, close := tlsServer(handler)
+	defer close()
+
+	options.Hosts = ConfigureDefaultRegistries(WithClient(options.Client))
+	resolver := NewResolver(options)
+	ref := fmt.Sprintf("%s/%s:%s", base, name, tag)
+
+	_, _, err := resolver.Resolve(context.Background(), ref)
+	if err == nil {
+		t.Fatal("expected error from resolve, got nil")
+	}
+
+	if !strings.Contains(err.Error(), "403") {
+		t.Errorf("expected 403 in error, got: %s", err.Error())
 	}
 }

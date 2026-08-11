@@ -24,13 +24,41 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
+	"github.com/opencontainers/go-digest"
 
 	"github.com/containerd/containerd/v2/core/mount"
 )
+
+// CacheBlobPath returns the layer content cache path for a diffID, following the
+// <dir>/<algo>/<xx>/<hex>.erofs layout, where <xx> is the first two characters of
+// the encoded digest. The extra prefix directory shards blobs so no single
+// directory grows unwieldy for a large cache. It is the single source of the
+// layout, shared by the cache producer (ctr build-erofs-cache) and the erofs
+// snapshotter that reads it, so the two never drift.
+func CacheBlobPath(dir string, diffID digest.Digest) string {
+	enc := diffID.Encoded()
+	return filepath.Join(dir, diffID.Algorithm().String(), enc[:2], enc+".erofs")
+}
+
+// IsErofsMediaType returns true if the media type is an EROFS layer type.
+func IsErofsMediaType(mt string) bool {
+	return strings.HasPrefix(mt, "application/vnd.erofs.layer")
+}
+
+func mkfsEnv(layerPath string) []string {
+	if runtime.GOOS != "windows" {
+		return nil
+	}
+	env := os.Environ()
+	tmpdir := filepath.Dir(layerPath)
+	env = append(env, "TMPDIR="+tmpdir)
+	return env
+}
 
 func ConvertTarErofs(ctx context.Context, r io.Reader, layerPath, uuid string, mkfsExtraOpts []string) error {
 	args := append([]string{"--tar=f", "--aufs", "--quiet", "-Enoinline_data"}, mkfsExtraOpts...)
@@ -40,6 +68,7 @@ func ConvertTarErofs(ctx context.Context, r io.Reader, layerPath, uuid string, m
 	args = append(args, layerPath)
 	cmd := exec.CommandContext(ctx, "mkfs.erofs", args...)
 	cmd.Stdin = r
+	cmd.Env = mkfsEnv(layerPath)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("erofs apply failed: %s: %w", out, err)
@@ -74,6 +103,7 @@ func GenerateTarIndexAndAppendTar(ctx context.Context, r io.Reader, layerPath, u
 	args = append(args, layerPath)
 	cmd := exec.CommandContext(ctx, "mkfs.erofs", args...)
 	cmd.Stdin = teeReader
+	cmd.Env = mkfsEnv(layerPath)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("tar index generation failed with command 'mkfs.erofs %s': %s: %w",
@@ -103,10 +133,24 @@ func GenerateTarIndexAndAppendTar(ctx context.Context, r io.Reader, layerPath, u
 	return nil
 }
 
+// AddDefaultMkfsOpts adds default options for mkfs.erofs
+func AddDefaultMkfsOpts(mkfsExtraOpts []string) []string {
+	// Check if -b argument is already present
+	for _, opt := range mkfsExtraOpts {
+		if strings.HasPrefix(opt, "-b") {
+			return mkfsExtraOpts
+		}
+	}
+
+	// Default to a 4K block size so images mount on any page size.
+	return append([]string{"-b4096"}, mkfsExtraOpts...)
+}
+
 func ConvertErofs(ctx context.Context, layerPath string, srcDir string, mkfsExtraOpts []string) error {
 	args := append([]string{"--quiet", "-Enoinline_data"}, mkfsExtraOpts...)
 	args = append(args, layerPath, srcDir)
 	cmd := exec.CommandContext(ctx, "mkfs.erofs", args...)
+	cmd.Env = mkfsEnv(layerPath)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("erofs apply failed: %s: %w", out, err)

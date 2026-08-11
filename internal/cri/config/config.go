@@ -125,6 +125,12 @@ type Runtime struct {
 	// shim - means use whatever Controller implementation provided by shim (e.g. use RemoteController).
 	// podsandbox - means use Controller implementation from sbserver podsandbox package.
 	Sandboxer string `toml:"sandboxer" json:"sandboxer"`
+	// DisablePauseImagePull disables the automatic pre-pull of the pause container image
+	// in ensurePauseImageExists() during RunPodSandbox. When set to true, the shim controller
+	// implementation is responsible for ensuring the pause image (or its equivalent) is available.
+	// This is useful for sandboxers that do not require the host-level pause image.
+	// Default: false (CRI pre-pulls the pause image for all runtimes).
+	DisablePauseImagePull bool `toml:"disable_pause_image_pull" json:"disablePauseImagePull"`
 	// IOType defines how containerd transfer the io streams of the container
 	// if it is not set, the named pipe will be created for the container
 	// we can also set it to "streaming" to create a stream by streaming api,
@@ -441,6 +447,10 @@ type RuntimeConfig struct {
 	//   https://golang.org/pkg/time/#ParseDuration
 	// Default: "2m"
 	StatsRetentionPeriod string `toml:"stats_retention_period" json:"statsRetentionPeriod"`
+
+	// EnableCRIU enables CRIU (Checkpoint/Restore In Userspace) support.
+	// When set to false, checkpoint/restore operations will be disabled.
+	EnableCRIU *bool `toml:"enable_criu" json:"enableCRIU"`
 }
 
 // X509KeyPairStreaming contains the x509 configuration for streaming

@@ -23,9 +23,11 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
+	"github.com/containerd/containerd/v2/defaults"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 )
 
@@ -40,11 +42,9 @@ type deferredPipeConnection struct {
 }
 
 func (dpc *deferredPipeConnection) Read(p []byte) (n int, err error) {
+	dpc.wg.Wait()
 	if dpc.c == nil {
-		dpc.wg.Wait()
-		if dpc.c == nil {
-			return 0, dpc.conerr
-		}
+		return 0, dpc.conerr
 	}
 	return dpc.c.Read(p)
 }
@@ -92,4 +92,8 @@ func checkCopyShimLogError(ctx context.Context, err error) error {
 		return nil
 	}
 	return err
+}
+
+func defaultSocketDir() string {
+	return filepath.Join(defaults.DefaultStateDir, "s")
 }

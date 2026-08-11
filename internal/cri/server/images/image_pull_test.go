@@ -757,3 +757,143 @@ func TestTransferProgressReporter(t *testing.T) {
 		})
 	}
 }
+
+// TestPullProgressReporter covers the core no-progress cancellation
+// behavior of pullProgressReporter: a stuck request (active, no bytes)
+// is eventually cancelled, while a progressing request is not.
+//
+// The flaky failure in TestCRIImagePullTimeout/HoldingContentOpenWriterWithLocalPull
+// — which this fix addresses — is a timing race that's not cleanly
+// expressible as a unit test: the boundary between the buggy and fixed
+// cancel times coincides at 1.5*timeout, so any check near that
+// threshold is scheduler-jitter prone. The semantic regression is
+// covered by the existing integration test.
+func TestPullProgressReporter(t *testing.T) {
+	t.Run("StuckRequestStillGetsCancelled", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		cancelCalled := make(chan struct{})
+		reporter := newPullProgressReporter("test-image:latest", func() {
+			select {
+			case <-cancelCalled:
+			default:
+				close(cancelCalled)
+			}
+		}, 200*time.Millisecond)
+
+		// Start a request immediately (no idle period) and never produce
+		// bytes. The reporter must cancel after timeout elapses.
+		reporter.reqReporter.incRequest()
+		reporter.start(ctx)
+
+		select {
+		case <-cancelCalled:
+		case <-time.After(2 * time.Second):
+			t.Fatal("stuck request was not cancelled")
+		}
+	})
+
+	t.Run("ProgressingRequestIsNotCancelled", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		cancelCalled := make(chan struct{})
+		reporter := newPullProgressReporter("test-image:latest", func() {
+			select {
+			case <-cancelCalled:
+			default:
+				close(cancelCalled)
+			}
+		}, 200*time.Millisecond)
+
+		reporter.reqReporter.incRequest()
+		reporter.start(ctx)
+
+		// Advance bytes faster than timeout so the reporter keeps
+		// refreshing lastSeenBytesRead.
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			ticker := time.NewTicker(50 * time.Millisecond)
+			defer ticker.Stop()
+			for i := 0; i < 10; i++ {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					reporter.reqReporter.incByteRead(1024)
+				}
+			}
+		}()
+
+		select {
+		case <-cancelCalled:
+			t.Fatal("pull was cancelled despite making byte progress")
+		case <-done:
+		}
+	})
+}
+
+// fakeObserver records every Observe call so tests can assert both the
+// presence and the value of observations without touching the real histogram.
+type fakeObserver struct {
+	samples []float64
+}
+
+func (f *fakeObserver) Observe(v float64) {
+	f.samples = append(f.samples, v)
+}
+
+func TestRecordImagePullThroughput(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		bytesPulled uint64
+		duration    time.Duration
+		wantSamples int
+		wantValue   float64 // only checked when wantSamples == 1
+	}{
+		{
+			name:        "fully cached pull is not observed",
+			bytesPulled: 0,
+			duration:    2 * time.Second,
+			wantSamples: 0,
+		},
+		{
+			name:        "zero duration is not observed",
+			bytesPulled: 10 * mibToByte,
+			duration:    0,
+			wantSamples: 0,
+		},
+		{
+			name:        "cold pull observes MiB/s from fetched bytes",
+			bytesPulled: 10 * mibToByte,
+			duration:    2 * time.Second,
+			wantSamples: 1,
+			wantValue:   5.0,
+		},
+		{
+			name: "partial cache hit observes only fetched bytes",
+			// 200 MiB image, 150 MiB cached, 50 MiB actually fetched over 1s.
+			bytesPulled: 50 * mibToByte,
+			duration:    1 * time.Second,
+			wantSamples: 1,
+			wantValue:   50.0,
+		},
+		{
+			name:        "sub-second pull observes correctly",
+			bytesPulled: 25 * mibToByte,
+			duration:    500 * time.Millisecond,
+			wantSamples: 1,
+			wantValue:   50.0,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			obs := &fakeObserver{}
+			recordImagePullThroughput(obs, tc.bytesPulled, tc.duration)
+			if assert.Len(t, obs.samples, tc.wantSamples) && tc.wantSamples == 1 {
+				assert.InDelta(t, tc.wantValue, obs.samples[0], 0.001)
+			}
+		})
+	}
+}

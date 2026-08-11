@@ -24,6 +24,7 @@ import (
 	"github.com/containerd/plugin"
 	"github.com/containerd/plugin/registry"
 
+	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/plugins"
 	"github.com/containerd/containerd/v2/plugins/snapshots/erofs"
 	"github.com/docker/go-units"
@@ -52,12 +53,20 @@ type Config struct {
 	// DefaultSize is the default size of a writable layer in string
 	DefaultSize string `toml:"default_size"`
 
-	// MaxUnmergedLayers (>0) enables fsmerge when the number of image layers exceeds this value.
-	MaxUnmergedLayers uint `toml:"max_unmerged_layers"`
-
 	// DmverityMode controls dm-verity behavior: "auto" (use if available), "on" (require), "off" (disable)
 	// Linux only
 	DmverityMode string `toml:"dmverity_mode"`
+
+	// LayerContentCaches lists directories of pre-converted, diffID-keyed erofs
+	// layer blobs. Each is checked one by one and the first hit is used instead
+	// of downloading and converting the layer; a directory that doesn't exist is
+	// treated as a cache miss. Layers missing from all of them are converted
+	// normally.
+	//
+	// Only layers prepared without a parent can be served from the cache. With
+	// sequential unpacking that is the first layer alone, so getting hits for a
+	// whole image needs max_concurrent_unpacks > 1, which is not the default.
+	LayerContentCaches []string `toml:"layer_content_caches"`
 }
 
 func init() {
@@ -99,12 +108,12 @@ func init() {
 				opts = append(opts, erofs.WithDefaultSize(size))
 			}
 
-			if config.MaxUnmergedLayers > 0 {
-				opts = append(opts, erofs.WithFsMergeThreshold(config.MaxUnmergedLayers))
-			}
-
 			if config.DmverityMode != "" {
 				opts = append(opts, erofs.WithDmverityMode(config.DmverityMode))
+			}
+
+			if len(config.LayerContentCaches) > 0 {
+				opts = append(opts, erofs.WithLayerContentCaches(config.LayerContentCaches...))
 			}
 
 			// Don't bother supporting overlay's slow_chown, only RemapIDs
@@ -115,7 +124,7 @@ func init() {
 			}
 
 			ic.Meta.Exports[plugins.SnapshotterRootDir] = root
-			ic.Meta.Capabilities = append(ic.Meta.Capabilities, "rebase")
+			ic.Meta.Capabilities = append(ic.Meta.Capabilities, snapshots.RebaseCap)
 			return erofs.NewSnapshotter(root, opts...)
 		},
 	})

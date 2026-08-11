@@ -94,10 +94,6 @@ func NewTaskService(ctx context.Context, publisher shim.Publisher, sd shutdown.S
 		return nil, fmt.Errorf("failed to initialized platform behavior: %w", err)
 	}
 	go s.forward(ctx, publisher)
-	sd.RegisterCallback(func(context.Context) error {
-		close(s.events)
-		return nil
-	})
 
 	if address, err := shim.ReadAddress("address"); err == nil {
 		sd.RegisterCallback(func(context.Context) error {
@@ -225,9 +221,6 @@ func (s *service) preStart(c *runc.Container) (handleStarted func(*runc.Containe
 
 // Create a new initial process and container with the underlying OCI runtime
 func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (_ *taskAPI.CreateTaskResponse, err error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	s.lifecycleMu.Lock()
 	handleStarted, cleanup := s.preStart(nil)
 	s.lifecycleMu.Unlock()
@@ -238,7 +231,9 @@ func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (_ *
 		return nil, err
 	}
 
+	s.mu.Lock()
 	s.containers[r.ID] = container
+	s.mu.Unlock()
 
 	s.send(&eventstypes.TaskCreate{
 		ContainerID: r.ID,
@@ -710,7 +705,10 @@ func (s *service) oomEvent(id string) {
 }
 
 func (s *service) send(evt any) {
-	s.events <- evt
+	select {
+	case s.events <- evt:
+	case <-s.shutdown.Done():
+	}
 }
 
 // handleInitExit processes container init process exits.
@@ -813,13 +811,29 @@ func (s *service) getContainerPids(ctx context.Context, container *runc.Containe
 func (s *service) forward(ctx context.Context, publisher shim.Publisher) {
 	ns, _ := namespaces.Namespace(ctx)
 	ctx = namespaces.WithNamespace(context.Background(), ns)
-	for e := range s.events {
-		err := publisher.Publish(ctx, runtime.GetTopic(e), e)
-		if err != nil {
+	defer publisher.Close()
+
+	publish := func(e any) {
+		if err := publisher.Publish(ctx, runtime.GetTopic(e), e); err != nil {
 			log.G(ctx).WithError(err).Error("post event")
 		}
 	}
-	publisher.Close()
+
+	for {
+		select {
+		case e := <-s.events:
+			publish(e)
+		case <-s.shutdown.Done():
+			for {
+				select {
+				case e := <-s.events:
+					publish(e)
+				default:
+					return
+				}
+			}
+		}
+	}
 }
 
 func (s *service) getContainer(id string) (*runc.Container, error) {

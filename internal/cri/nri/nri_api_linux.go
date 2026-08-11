@@ -40,7 +40,6 @@ import (
 	"github.com/containerd/log"
 	"github.com/containerd/typeurl/v2"
 	runtimespec "github.com/opencontainers/runtime-spec/specs-go"
-	"github.com/opencontainers/runtime-tools/generate"
 	cri "k8s.io/cri-api/pkg/apis/runtime/v1"
 
 	"github.com/containerd/containerd/v2/internal/nri"
@@ -368,8 +367,7 @@ func (a *API) WithContainerAdjustment() containerd.NewContainerOpts {
 			return nil
 		}
 
-		sgen := generate.Generator{Config: spec}
-		ngen := nrigen.SpecGenerator(&sgen, generatorOptions...)
+		ngen := nrigen.SpecGenerator(newSpecGen(spec), generatorOptions...)
 
 		err = ngen.Adjust(adjust)
 		if err != nil {
@@ -682,7 +680,8 @@ func (p *criPodSandbox) GetPid() uint32 {
 }
 
 func (p *criPodSandbox) GetIPs() []string {
-	if p.IP == "" {
+	// IP and AdditionalIPs are promoted fields from the embedded Sandbox struct.
+	if p.Sandbox == nil || p.IP == "" {
 		return nil
 	}
 	ips := append([]string{p.IP}, p.AdditionalIPs...)
